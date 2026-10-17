@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2026 OpenCode Pet contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+TRADEMARK NOTICE
+
+This project is an independent, unofficial desktop pet for the OpenCode
+desktop application.  It is not affiliated with, endorsed by, or sponsored by
+the OpenCode team.  "OpenCode" and the OpenCode logo are trademarks of their
+respective owner.  OpenCode's own source code is open source, but a code
+licence is not a blanket licence to its brand assets.
+
+The character "OpenO" is an original anthropomorphised interpretation of the
+official geometric mark, created for this project and used here for personal,
+non-commercial desktop-pet purposes.  The official mark in
+`assets/brand/opencode-logo-light.svg` is reproduced for identification only
+and remains the property of its owner.

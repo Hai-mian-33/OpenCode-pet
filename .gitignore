@@ -1,0 +1,40 @@
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Test and lint caches ---------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors ----------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+
+# --- The pet's own runtime state --------------------------------------------
+# These belong to an *installed* copy, never to the repository.  An installed
+# pet writes pet_state.json next to the app and logs under state/.
+pet_state.json
+state/
+*.log
+*.lnk
+*.tmp
+
+# --- Artwork source ---------------------------------------------------------
+# art/ holds design documentation. It is committed, because a repository should
+# explain how its character was drawn - but an installation must not carry it,
+# which install.py guarantees by skipping the directory outright.
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
