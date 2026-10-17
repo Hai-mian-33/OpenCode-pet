@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from petcore import endpoint as endpoint_mod
 from petcore import i18n, paths
+from petcore.liveness import AbsentConfirm
 from petcore.lock import SingleInstance, pid_alive
 from petcore.lock import lock_path as single_instance_path
 
@@ -41,7 +42,6 @@ LAUNCH_LOCK = 12.0          # seconds to wait after a launch before retrying
 # A launch that produced no pet must be retried sooner than this, or a crashed
 # pet leaves the desktop empty for twelve seconds.
 RETRY_SECONDS = 2.5
-
 
 def log(message: str) -> None:
     try:
@@ -84,7 +84,13 @@ def pet_entry() -> str:
     return os.path.join(paths.APP_ROOT, "opencode_pet.py")
 
 
-def _running_command_lines(needle: str):
+def _running_command_lines(needle: str, root: str = None):
+    """Every live process whose command line contains ``needle``.
+
+    ``root`` narrows the match to a process launched *from that application
+    root* - see ``_owns``.  Without it a bare script-name match finds every copy
+    of this project on the machine.
+    """
     try:
         import psutil  # type: ignore
         found = []
@@ -94,11 +100,55 @@ def _running_command_lines(needle: str):
             except Exception:                              # noqa: BLE001
                 continue
             joined = " ".join(cmdline)
-            if needle in joined and "pet_watcher" not in joined:
-                found.append((int(proc.info["pid"]), joined))
+            if needle not in joined or "pet_watcher" in joined:
+                continue
+            if root is not None and not _started_from(cmdline, root):
+                continue
+            found.append((int(proc.info["pid"]), joined))
         return found
     except Exception:                                      # noqa: BLE001
         return []
+
+
+def _started_from(cmdline, root: str) -> bool:
+    """Whether ``cmdline`` launches a script that lives inside ``root``.
+
+    The script path is the reliable signal here.  The *working directory* is not
+    available through ``psutil.process_iter`` without another syscall per
+    process, and a copy started by double-clicking has a bare
+    ``opencode_pet.py`` in its arguments with no directory at all - so the path
+    of the script being run is what has to be checked, on both the absolute and
+    the drive-relative spellings Windows allows.
+    """
+    try:
+        root_abs = os.path.normcase(os.path.abspath(root))
+        for part in cmdline:
+            if not part or not part.lower().endswith(".py"):
+                continue
+            try:
+                absolute = os.path.normcase(os.path.abspath(part))
+            except (OSError, ValueError):
+                continue
+            if absolute.startswith(root_abs + os.sep):
+                return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _owns(root: str, needle: str = None):
+    """(pid, cmdline) for pets belonging to *this* installation only.
+
+    This is the guard that keeps one copy of the project from meddling with
+    another.  The single-instance lock already prevents two pets from running at
+    once, but the sentinel still has to answer "is *my* pet running?" and the
+    old code answered it with a machine-wide script-name match.  That is how a
+    sentinel started from a development folder ended up killing the pet that was
+    serving the installed copy: it found a process called ``opencode_pet.py``,
+    could not tell whose it was, and terminated it.
+    """
+    needle = needle or os.path.basename(pet_entry())
+    return _running_command_lines(needle, root=root)
 
 
 def pet_running() -> bool:
@@ -112,8 +162,7 @@ def pet_running() -> bool:
     holder = _pet_lock_holder()
     if holder and holder != os.getpid() and pid_alive(holder):
         return True
-    entry = os.path.basename(pet_entry())
-    return bool(_running_command_lines(entry))
+    return bool(_owns(paths.APP_ROOT))
 
 
 def _pet_lock_holder() -> int:
@@ -137,11 +186,16 @@ def _lock_holder(path: str) -> int:
 
 
 def kill_pet() -> None:
-    """Stop the pet by its lock holder, falling back to a command-line match.
+    """Stop *this installation's* pet.
 
     The lock is authoritative because the command line varies with how the pet
     was started; the name match is kept for a pet whose lock was removed while
     it was still running.
+
+    Both are scoped to ``APP_ROOT``.  An unscoped match would make this a
+    machine-wide kill switch: any copy of the project could stop any other
+    copy's pet, and a stale lock file left behind in one checkout would be
+    enough to do it.
     """
     # ``SingleInstance`` here only computes the path; the sentinel never claims
     # the pet's lock, because that is the pet's to hold.
@@ -151,8 +205,7 @@ def kill_pet() -> None:
         stopped.append(holder)
         _terminate(holder)
 
-    entry = os.path.basename(pet_entry())
-    for pid, _cmdline in _running_command_lines(entry):
+    for pid, _cmdline in _owns(paths.APP_ROOT):
         if pid not in stopped:
             _terminate(pid)
             stopped.append(pid)
@@ -247,42 +300,79 @@ def main(argv=None) -> int:
         release_single_instance()
 
 
-def _loop(args, lang: str) -> int:
+def _loop(args, lang: str, clock=None) -> int:
+    """Poll OpenCode and keep the pet in step with it.
+
+    ``clock`` is the monotonic time source used for the sustained-absence
+    grace period.  It is a parameter rather than a direct ``time.monotonic()``
+    call so the tests can drive a whole shutdown in microseconds instead of
+    sleeping through the real grace period.
+    """
+    clock = clock or time.monotonic
     if args.always_show and not pet_running():
         launch_pet(lang)
 
     app_up = False
     launched_at = 0.0
+    gone = AbsentConfirm()
+
     while True:
-        # ``app_alive``, not ``desktop_running``: closing the OpenCode window
-        # leaves ``opencode-cli serve --service`` running, and the sessions it
-        # holds are still there.  Watching the window alone made the pet exit
-        # while OpenCode itself was alive, taking away the only way back into a
-        # closed app.  The pet now leaves with the background service, not with
-        # the window.
-        alive = endpoint_mod.app_alive()
-        window = endpoint_mod.desktop_running()
-        if alive and not app_up:
-            app_up = True
-            log("opencode detected%s" % ("" if window else " (service only)"))
-            if not pet_running():
-                launch_pet(lang)
-                launched_at = time.time()
-        elif not alive and app_up:
-            app_up = False
-            log("opencode and its background service are both gone")
-            kill_pet()
+        # Nothing below may escape.  The sentinel is started **once**, at
+        # sign-in, and nothing restarts it: an exception reaching this frame
+        # would end the only process that can bring the pet back, leaving the
+        # desktop empty until the next logon with nothing in any log to say why.
+        # So each pass is isolated and a failing pass is logged and retried.
+        try:
+            # ``app_alive``, not ``desktop_running``: closing the OpenCode window
+            # leaves ``opencode-cli serve --service`` running, and the sessions it
+            # holds are still there.  Watching the window alone made the pet exit
+            # while OpenCode itself was alive, taking away the only way back
+            # into a closed app.
+            alive = endpoint_mod.app_alive()
+            window = endpoint_mod.desktop_running()
 
-        if alive and not pet_running():
-            # Retry quickly if the last launch produced nothing, so a crash
-            # cannot leave the desktop empty for long.
-            waited = time.time() - launched_at
-            if waited > LAUNCH_LOCK or (launched_at and waited > RETRY_SECONDS):
-                launch_pet(lang)
-                launched_at = time.time()
+            # Absence has to be *sustained* before anything irreversible
+            # happens.  This used to act on a single failed scan, and the log
+            # recorded what that cost, in one second:
+            #
+            #     20:13:43 opencode detected (service only)
+            #     20:13:43 opencode and its background service are both gone
+            #
+            # One empty process enumeration - a service restart, a plugin reload,
+            # a ``psutil`` throw with an empty ``tasklist`` fallback - was enough
+            # to stop the pet for the rest of the session.  See
+            # ``petcore/liveness.py``.
+            confirmed_gone = gone.update(alive, clock())
 
-        if args.once:
-            return 0
+            if confirmed_gone:
+                if app_up:
+                    app_up = False
+                    log("opencode and its background service are gone "
+                        "(confirmed after %.1fs)" % gone.grace)
+                    kill_pet()
+            elif alive:
+                if not app_up:
+                    app_up = True
+                    log("opencode detected%s"
+                        % ("" if window else " (service only)"))
+                # A blip that did not last is simply not acted on: no log line,
+                # no teardown, and ``app_up`` is left exactly as it was.
+                if not pet_running():
+                    # Retry quickly if the last launch produced nothing, so a
+                    # crash cannot leave the desktop empty for long.
+                    waited = time.time() - launched_at
+                    if waited > LAUNCH_LOCK or (launched_at
+                                                and waited > RETRY_SECONDS):
+                        launch_pet(lang)
+                        launched_at = time.time()
+
+            if args.once:
+                return 0
+        except Exception as exc:                          # noqa: BLE001
+            log("poll failed (%r); continuing" % (exc,))
+            if args.once:
+                return 1
+
         time.sleep(POLL_SECONDS)
 
 

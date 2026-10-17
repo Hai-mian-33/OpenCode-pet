@@ -22,7 +22,15 @@ from . import paths
 
 
 def lock_path(name: str) -> str:
-    return os.path.join(paths.state_dir(), name)
+    """The shared lock file for ``name``.
+
+    Resolved against ``paths.lock_dir()`` - OpenCode's config directory - and
+    not against ``APP_ROOT``, so a copy of this project sitting anywhere else on
+    the machine contends for the *same* lock.  A per-copy lock would let every
+    stray checkout start its own pet, and then two pets would share one desktop
+    while each one's sentinel could stop the other.  See ``paths.lock_dir``.
+    """
+    return os.path.join(paths.lock_dir(), name)
 
 
 def _read_pid(path: str) -> int:
@@ -90,7 +98,7 @@ class SingleInstance:
         self._owned = False
 
     def acquire(self, attempts: int = 3) -> bool:
-        os.makedirs(paths.state_dir(), exist_ok=True)
+        os.makedirs(paths.lock_dir(), exist_ok=True)
         for _ in range(max(1, attempts)):
             try:
                 handle = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)

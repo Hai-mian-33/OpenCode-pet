@@ -1491,14 +1491,22 @@ class TestSingleInstanceLock(unittest.TestCase):
         import tempfile
         self._folder = tempfile.mkdtemp(prefix="pet-lock-")
         self._original = paths_state_dir
+        self._original_lock_dir = None
         import petcore.paths
         petcore.paths.state_dir = lambda: self._folder
+        # The locks moved out of ``state_dir()`` and into ``lock_dir()`` so
+        # that every copy of the project on the machine shares them.  The
+        # redirection has to follow them, or these tests would write to the real
+        # ``~/.config/opencode/pet-locks`` and collide with the installed pet.
+        self._original_lock_dir = petcore.paths.lock_dir
+        petcore.paths.lock_dir = lambda: self._folder
         self.addCleanup(self._restore)
 
     def _restore(self):
         import shutil
         import petcore.paths
         petcore.paths.state_dir = self._original
+        petcore.paths.lock_dir = self._original_lock_dir
         shutil.rmtree(self._folder, ignore_errors=True)
 
     def test_a_second_claim_is_refused(self):
@@ -1561,6 +1569,11 @@ class TestSingleInstanceLock(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = dict(os.environ)
         env["OPENCODE_PET_STATE_DIR"] = self._folder
+        # The locks are shared machine-wide now, so this test has to redirect
+        # them too - otherwise it collides with the real, running pet.  It is an
+        # env var rather than a monkeypatch because the fixtures are real
+        # subprocesses.
+        env["OPENCODE_PET_LOCK_DIR"] = self._folder
         env["PYTHONIOENCODING"] = "utf-8"
         # A first process that holds the lock and waits.
         holder = subprocess.Popen(
@@ -2504,7 +2517,9 @@ class TestWatcher(unittest.TestCase):
         import pet_watcher
         from petcore import endpoint as endpoint_mod
 
-        # (window, service) at each poll, in order.
+        # (window, service) at each poll, in order.  The tail is a *sustained*
+        # absence on purpose: the sentinel used to tear the pet down on the
+        # first empty scan, which is the bug this test now also guards.
         script = [
             (False, False),     # OpenCode not started
             (False, True),      # service up, window closed
@@ -2512,6 +2527,10 @@ class TestWatcher(unittest.TestCase):
             (False, True),      # window closed again, service still up
             (False, True),
             (False, False),     # service finally ended
+            (False, False),
+            (False, False),
+            (False, False),
+            (False, False),     # ...and stayed ended
         ]
         index = {"i": 0}
         original = (endpoint_mod.desktop_running, endpoint_mod.service_running,
@@ -2522,7 +2541,12 @@ class TestWatcher(unittest.TestCase):
         class Done(Exception):
             pass
 
-        def fake_sleep(_seconds):
+        # Each poll is POLL_SECONDS apart, so the fake clock has to move with the
+        # fake sleep or the grace period never elapses.
+        now = {"t": 1000.0}
+
+        def fake_sleep(seconds):
+            now["t"] += seconds
             index["i"] += 1
             if index["i"] >= len(script):
                 raise Done
@@ -2546,7 +2570,7 @@ class TestWatcher(unittest.TestCase):
             once = False
 
         try:
-            pet_watcher._loop(Args(), "en")
+            pet_watcher._loop(Args(), "en", clock=lambda: now["t"])
         except Done:
             pass
         finally:
@@ -2603,7 +2627,6 @@ class TestWatcher(unittest.TestCase):
         self.assertTrue(entry.endswith(os.path.join("", "opencode_pet.py")))
         self.assertTrue(os.path.isfile(entry))
         self.assertTrue(entry.startswith(pet_watcher.paths.APP_ROOT))
-
     def test_pet_detection_can_see_this_process(self):
         import pet_watcher
         self.assertIsInstance(pet_watcher.pet_running(), bool)
@@ -2615,7 +2638,12 @@ class TestWatcher(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             import petcore.paths
             original = petcore.paths.state_dir
+            original_lock = petcore.paths.lock_dir
             petcore.paths.state_dir = lambda: folder
+            # The sentinel lock is machine-wide now, so it has to be redirected
+            # as well - otherwise this test finds the real sentinel already
+            # holding it, which is the shared lock doing its job.
+            petcore.paths.lock_dir = lambda: folder
             try:
                 self.assertIsNone(pet_watcher.acquire_single_instance())
                 self.assertTrue(os.path.isfile(pet_watcher.lock_path()))
@@ -2635,7 +2663,237 @@ class TestWatcher(unittest.TestCase):
                 self.assertFalse(os.path.exists(pet_watcher.lock_path()))
             finally:
                 petcore.paths.state_dir = original
+                petcore.paths.lock_dir = original_lock
                 pet_watcher._SENTINEL_GUARD.clear()
+
+
+# ---------------------------------------------------------------------------
+class TestSustainedAbsence(unittest.TestCase):
+    """Why the pet vanished on 2026-10-17, and the rule that prevents it.
+
+    The sentinel's own log recorded the whole failure in one second::
+
+        20:13:43 opencode detected (service only)
+        20:13:43 opencode and its background service are both gone
+
+    ``app_alive()`` is a live process enumeration, not a fact.  It returned an
+    empty result for one poll - a service restart, a plugin reload, a ``psutil``
+    throw with an empty ``tasklist`` fallback - and both halves of the pet acted
+    on that single observation.  The pet quit, the sentinel quit, and because
+    the sentinel is only started at sign-in nothing brought either back for the
+    rest of the session.
+    """
+
+    def test_one_empty_scan_is_not_enough_to_conclude_anything(self):
+        from petcore.liveness import AbsentConfirm
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        t = 1000.0
+        self.assertFalse(gone.update(True, t))
+        # A single miss, and then OpenCode is right back.
+        self.assertFalse(gone.update(False, t + 1.5))
+        self.assertFalse(gone.update(True, t + 3.0))
+        self.assertFalse(gone.confirmed,
+                         "one failed scan must never count as OpenCode closing")
+
+    def test_absence_must_persist_before_it_counts(self):
+        from petcore.liveness import AbsentConfirm
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        t = 1000.0
+        gone.update(True, t)
+        fired = [gone.update(False, t + 1.5 * n) for n in range(1, 5)]
+        self.assertFalse(any(fired),
+                         "four fast samples are not six seconds of absence")
+        self.assertFalse(gone.confirmed)
+
+    def test_a_real_shutdown_is_acted_on_exactly_once(self):
+        from petcore.liveness import AbsentConfirm
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        t = 1000.0
+        gone.update(True, t)
+        fired = 0
+        for n in range(1, 12):
+            if gone.update(False, t + 1.5 * n):
+                fired += 1
+        self.assertEqual(fired, 1,
+                         "teardown must happen once, not on every later poll")
+        self.assertTrue(gone.confirmed)
+
+    def test_seeing_opencode_again_resets_everything(self):
+        from petcore.liveness import AbsentConfirm
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        t = 1000.0
+        gone.update(True, t)
+        for n in range(1, 4):
+            gone.update(False, t + 1.5 * n)
+        gone.update(True, t + 10.0)
+        self.assertFalse(gone.confirmed)
+        self.assertEqual(gone.samples, 0)
+        # ...and the clock starts over from scratch.
+        self.assertFalse(gone.update(False, t + 11.0))
+
+    def test_a_fast_polling_loop_cannot_outrun_the_sample_floor(self):
+        """A grace period measured only in seconds is defeated by a hot loop."""
+        from petcore.liveness import AbsentConfirm
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        t = 1000.0
+        gone.update(True, t)
+        for n in range(1, 60):          # 60 polls spread over 6 seconds
+            if gone.update(False, t + 0.1 * n):
+                break
+        self.assertFalse(gone.confirmed,
+                         "60 polls in 6s is not 4 observations plus 6s")
+
+    def test_the_sentinel_survives_a_poll_that_raises(self):
+        """One failing poll must not be the sentinel's last act.
+
+        The sentinel starts once, at sign-in.  An exception escaping the loop
+        ends the only process that can restart the pet, silently - which is
+        exactly the "the pet disappeared and never came back" symptom, with
+        nothing in any log.
+        """
+        import pet_watcher
+        from petcore import endpoint as endpoint_mod
+
+        script = [True, "boom", True, True]
+        index = {"i": 0}
+        original = (pet_watcher.endpoint_mod, pet_watcher.launch_pet,
+                    pet_watcher.pet_running, pet_watcher.kill_pet,
+                    pet_watcher.time.sleep, endpoint_mod.app_alive,
+                    endpoint_mod.desktop_running)
+
+        class Done(Exception):
+            pass
+
+        now = {"t": 1000.0}
+
+        def fake_sleep(seconds):
+            now["t"] += seconds
+            index["i"] += 1
+            if index["i"] >= len(script):
+                raise Done
+
+        def flaky_alive():
+            step = script[index["i"]]
+            if step == "boom":
+                raise RuntimeError("psutil exploded")
+            return bool(step)
+
+        pet_up = [False]
+        actions = []
+        endpoint_mod.app_alive = flaky_alive
+        endpoint_mod.desktop_running = lambda: False
+        pet_watcher.endpoint_mod = endpoint_mod
+        pet_watcher.launch_pet = lambda lang="": (actions.append("launch"),
+                                                  pet_up.__setitem__(0, True))
+        pet_watcher.pet_running = lambda: pet_up[0]
+        pet_watcher.kill_pet = lambda: actions.append("stop")
+        pet_watcher.time.sleep = fake_sleep
+
+        class Args:
+            always_show = False
+            once = False
+
+        try:
+            pet_watcher._loop(Args(), "en", clock=lambda: now["t"])
+            reached_end = True
+        except Done:
+            reached_end = True
+        except Exception:                                # noqa: BLE001
+            reached_end = False
+        finally:
+            (pet_watcher.endpoint_mod, pet_watcher.launch_pet,
+             pet_watcher.pet_running, pet_watcher.kill_pet,
+             pet_watcher.time.sleep, endpoint_mod.app_alive,
+             endpoint_mod.desktop_running) = original
+
+        self.assertTrue(reached_end,
+                        "the sentinel loop let an exception escape")
+        self.assertEqual(actions, ["launch"],
+                         "it must keep working after a failed poll, and the "
+                         "failed poll must not stop the pet (got %r)" % (actions,))
+
+
+# ---------------------------------------------------------------------------
+class TestOneInstallationOnly(unittest.TestCase):
+    """The pet lives in OpenCode's config, and only there.
+
+    A copy of this project started from anywhere else used to get its own
+    private lock, its own private pet - and a sentinel that would stop whichever
+    pet it found first.  That is how a development folder on the Desktop killed
+    the installed pet: it matched on the bare script name, could not tell whose
+    process it had found, and terminated it.
+    """
+
+    def test_the_lock_is_shared_by_every_copy_on_the_machine(self):
+        from petcore import paths
+        import petcore.lock as lock_mod
+        lock_dir = paths.lock_dir()
+        self.assertTrue(lock_dir, "there must be one shared lock directory")
+        self.assertNotIn("state", os.path.basename(lock_dir).lower(),
+                         "the lock must not live under a per-copy state dir")
+        # It is anchored to OpenCode's config, so it is the same path for every
+        # APP_ROOT - including an installed copy and a checkout on the Desktop.
+        self.assertTrue(os.path.normcase(lock_dir).startswith(
+            os.path.normcase(paths.opencode_config_dir())))
+
+    def test_a_lock_in_the_old_per_copy_location_is_not_consulted(self):
+        from petcore.lock import lock_path
+        path = lock_path("pet.lock")
+        self.assertNotIn(os.path.join("state", "pet.lock"),
+                         os.path.normpath(path).lower())
+
+    def test_a_pet_from_another_installation_is_not_matched(self):
+        """Process matching is scoped to this installation's root."""
+        import pet_watcher
+        self.assertFalse(pet_watcher._started_from(
+            [r"C:\\somewhere\\else\\opencode_pet.py"],
+            r"C:\\Users\\me\\.config\\opencode\\pet"))
+        self.assertTrue(pet_watcher._started_from(
+            [r"C:\\Users\\me\\.config\\opencode\\pet\\opencode_pet.py"],
+            r"C:\\Users\\me\\.config\\opencode\\pet"))
+        # A sibling directory that merely shares a prefix is still a stranger.
+        self.assertFalse(pet_watcher._started_from(
+            [r"C:\\Users\\me\\.config\\opencode\\pet-dev\\opencode_pet.py"],
+            r"C:\\Users\\me\\.config\\opencode\\pet"))
+
+    def test_kill_pet_only_ever_targets_this_installation(self):
+        """``kill_pet`` must not be a machine-wide switch."""
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "pet_watcher.py"), "r",
+                  encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "kill_pet":
+                continue
+            calls = [n for n in ast.walk(node)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Name)
+                     and n.func.id == "_running_command_lines"]
+            for call in calls:
+                self.assertIsNotNone(
+                    call.keywords and any(k.arg == "root" for k in call.keywords),
+                    "kill_pet must scope its process match with root=")
+            return
+        self.fail("kill_pet not found")
+
+    def test_the_autostart_launcher_points_only_at_the_installation(self):
+        """The pet must come up at sign-in from the config directory alone."""
+        import install
+        import petcore.paths as paths
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "install.py"), "r", encoding="utf-8") as h:
+            source = h.read()
+        self.assertIn("pet_watcher.py", source)
+        # The launcher is written from ``target_root()``, i.e. the install
+        # directory - never from the directory the installer happens to run in.
+        tree = ast.parse(source)
+        functions = {n.name: n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef)}
+        self.assertIn("target_root", functions)
+        body = ast.dump(functions["target_root"])
+        self.assertIn("opencode_config_dir", body)
+        self.assertTrue(os.path.isdir(paths.opencode_config_dir()))
 
 
 # ---------------------------------------------------------------------------

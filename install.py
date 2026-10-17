@@ -245,13 +245,17 @@ def stop_running(wait: float = 1.5) -> int:
         time.sleep(1.0)
 
     # A surviving lock file would keep the next start from claiming it, so it
-    # has to go once the processes it names are gone.
+    # has to go once the processes it names are gone.  These live in the shared
+    # lock directory, not under the install folder - see ``paths.lock_dir()``.
+    from petcore import paths as paths_mod
+
     for name in ("pet.lock", "sentinel.lock"):
-        path = os.path.join(target, "state", name)
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        for candidate in (os.path.join(target, "state", name),
+                          os.path.join(paths_mod.lock_dir(), name)):
+            try:
+                os.unlink(candidate)
+            except OSError:
+                pass
     return stopped
 
 

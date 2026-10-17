@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from petcore import __version__, bridge as bridge_mod, client as client_mod
 from petcore import endpoint as endpoint_mod
 from petcore import i18n, paths, reducer
+from petcore.liveness import AbsentConfirm
 from petcore.reducer import DONE, ERROR, IDLE, OFFLINE, WAITING
 from petcore.settings import Settings
 
@@ -653,6 +654,9 @@ def run_app(args, settings: Settings) -> int:
     tray = None
     quit_requested = False
     app_seen = False
+    # Sustained-absence latch, shared with the sentinel's rule.  See
+    # ``petcore/liveness.py``.
+    gone = AbsentConfirm()
     last_app_open = True
     refresh_at = [0.0]
     demo_stop = threading.Event()
@@ -1000,13 +1004,23 @@ def run_app(args, settings: Settings) -> int:
         # intact, and the pet is then the only way back into the closed app -
         # quitting here threw that away for no reason.
         alive = endpoint_mod.app_alive()   # one scan; both names, not two calls
-        if alive and not app_seen:
+
+        # And do not act on a single empty scan.  ``app_alive`` is one
+        # observation of a live process list, not a fact: a service restart or a
+        # plugin reload empties it for a moment.  Quitting on that observation
+        # is unrecoverable, because the sentinel that would restart the pet only
+        # runs at sign-in - so absence has to be sustained first.  This is the
+        # same rule the sentinel uses, from the same class, so the two halves
+        # cannot disagree about how long "long enough" is.
+        if gone.update(alive):
+            if app_seen:
+                app_seen = False
+                log("OpenCode and its background service are both gone: %s"
+                    % i18n.t("cli.daemon_exit"))
+                quit_app()
+        elif alive and not app_seen:
             app_seen = True
             log("OpenCode detected; pet is up")
-        elif not alive and app_seen:
-            log("OpenCode and its background service are both gone: %s"
-                % i18n.t("cli.daemon_exit"))
-            quit_app()
 
     def tray_handlers() -> Dict:
         """Read by the tray every time the menu opens, so it is never stale."""

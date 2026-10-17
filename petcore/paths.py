@@ -88,6 +88,37 @@ def assets_dir() -> str:
     return os.path.join(APP_ROOT, "assets")
 
 
+def lock_dir() -> str:
+    """Where the single-instance locks live - deliberately *not* ``APP_ROOT``.
+
+    The locks used to sit in ``<APP_ROOT>/state``, which made them
+    **per-copy**.  That is wrong for a lock whose entire purpose is "only one
+    of me may run": every extra copy of this project on the machine - a
+    checkout on the Desktop, a zip someone extracted, a folder left over from
+    last week - got its own private lock and therefore its own private pet.
+    Two pets then shared one desktop, and whichever sentinel noticed a blip
+    would stop whichever pet it found first.
+
+    Anchoring the locks to OpenCode's own config directory makes them shared by
+    every copy on the machine, which is the property that actually matters.  The
+    *installed* copy's location is unchanged in practice, because it lives at
+    ``~/.config/opencode/pet``; a copy run from anywhere else now contends for
+    the same lock instead of quietly becoming a second pet.
+
+    Logs deliberately stay per-copy (``state_dir()``): a developer's log belongs
+    next to the code they are running, not in the installation.
+
+    ``OPENCODE_PET_LOCK_DIR`` overrides it, exactly as ``OPENCODE_PET_STATE_DIR``
+    overrides ``state_dir()``.  The test suite needs that because it starts real
+    subprocesses to prove the single-instance behaviour, and a monkeypatch in
+    the parent cannot reach a child process.
+    """
+    override = os.environ.get("OPENCODE_PET_LOCK_DIR")
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(opencode_config_dir(), "pet-locks")
+
+
 def docs_dir() -> str:
     return os.path.join(APP_ROOT, "docs")
 
