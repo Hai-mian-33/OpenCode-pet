@@ -60,6 +60,81 @@ GONE_GRACE_SECONDS = 6.0
 # that spins; the sample count is the floor.
 GONE_MIN_POLLS = 4
 
+# How long to distrust the very first process scan after the machine has been
+# asleep.  See ``SleepWatch``.
+RESUME_SETTLE_SECONDS = 20.0
+
+
+class SleepWatch:
+    """Notice that the machine suspended between two observations.
+
+    This is the fourth failure mode, and the one that explains the pet dying
+    overnight while everything looked healthy.
+
+    ``psutil.process_iter`` walks the whole process table.  On a laptop that
+    has just resumed, that walk can come back empty or raise - the system is
+    still rebuilding its process state, and the scheduler may not have run
+    every other process yet.  A liveness check that trusts such a sample sees
+    "OpenCode is gone" when OpenCode is very much alive, and the debounce above
+    cannot tell the difference: the machine really *was* unreachable for the
+    length of the resume.
+
+    The giveaway is that the two clocks disagree.  ``time.time`` advances
+    across a suspend; a monotonic clock read back-to-back barely moves.  So
+    sampling both and watching the *difference* detects a suspend with no
+    privileges, no event log and no guessing - and costs one extra call per
+    poll.
+
+    This laptop sleeps five times an hour.  That is not an edge case here.
+    """
+
+    def __init__(self, tolerance: float = 2.0,
+                 settle: float = RESUME_SETTLE_SECONDS) -> None:
+        # Anything above this many seconds of disagreement between the wall
+        # clock and the monotonic clock is a suspend, not a slow poll.
+        self.tolerance = float(tolerance)
+        self.settle = float(settle)
+        self._last = None              # type: tuple | None
+        self._settle_until = None      # type: float | None
+
+    @property
+    def settling(self) -> bool:
+        """True while a resume is still being given time to settle."""
+        return self.settling_at()
+
+    def settling_at(self, mono: float = None) -> bool:
+        """``settling``, against an explicit clock.
+
+        The ``now`` argument is what lets the tests drive a resume without
+        sleeping: they advance a fake monotonic clock, so the deadline has to be
+        compared against that same fake clock rather than the real one.
+        """
+        if self._settle_until is None:
+            return False
+        mono = time.monotonic() if mono is None else mono
+        return mono < self._settle_until
+
+    def update(self, wall: float = None, mono: float = None) -> bool:
+        """Record a sample; return True if the machine had been asleep.
+
+        Both clocks are passed in rather than read here so the tests can drive
+        a suspend deterministically.
+        """
+        wall = time.time() if wall is None else float(wall)
+        mono = time.monotonic() if mono is None else float(mono)
+
+        slept = False
+        if self._last is not None:
+            d_wall = wall - self._last[0]
+            d_mono = mono - self._last[1]
+            if d_wall - d_mono > self.tolerance:
+                slept = True
+                # The gap we just observed is the sleep itself, so start
+                # settling from *now* rather than from the stale sample.
+                self._settle_until = mono + self.settle
+        self._last = (wall, mono)
+        return slept
+
 
 class AbsentConfirm:
     """Latch "OpenCode has been gone long enough" until it is seen again.
@@ -102,13 +177,23 @@ class AbsentConfirm:
         return max(0.0, by_time, by_polls)
 
     # -- the one method that matters --------------------------------------
-    def update(self, alive: bool, now: float = None) -> bool:
+    def update(self, alive: bool, now: float = None, trust: bool = True) -> bool:
         """Record one observation; return True on the transition to confirmed.
 
         Returning the *transition* rather than the level is deliberate: both
         callers act by tearing the pet down, and doing that on every poll after
         the fact would be noise.  One absence, one teardown.
+
+        ``trust=False`` marks the observation as unreliable - the machine has
+        just resumed from sleep and the process table cannot be believed yet.
+        Such a sample is discarded completely: it neither counts towards the
+        grace period nor resets an absence already in progress, because it says
+        nothing either way.  Discarding it is the whole point: the alternative
+        is treating a resume as OpenCode closing.
         """
+        if not trust:
+            return False
+
         now = time.monotonic() if now is None else now
 
         if alive:

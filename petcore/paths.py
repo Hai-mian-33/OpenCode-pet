@@ -88,6 +88,53 @@ def assets_dir() -> str:
     return os.path.join(APP_ROOT, "assets")
 
 
+def quit_marker() -> str:
+    """The file whose mere existence means "the user asked the pet to stay off".
+
+    A latch rather than a preference, and deliberately *not* part of
+    ``pet_state.json``:
+
+    - it must be machine-global, like the locks.  ``pet_state.json`` lives inside
+      the application folder, so a checkout on the Desktop and the installation
+      in OpenCode's config have separate ones - and "I quit the pet" has to mean
+      "the pet is off", not "the copy I happened to click was off";
+    - it must survive a corrupt or missing settings file, because the one moment
+      it matters most is when something has already gone wrong;
+    - its meaning has to be obvious to whoever finds it.  A file called
+      ``pet-quit`` sitting in OpenCode's config directory explains itself; a
+      boolean buried in a JSON blob does not.
+
+    It lives in OpenCode's config directory rather than the install folder for
+    the same reason the locks do: everything that starts the pet has to agree
+    about whether it should.
+    """
+    return os.path.join(opencode_config_dir(), "pet-quit")
+
+
+def user_quit() -> bool:
+    """Whether the user has asked for the pet to stay off."""
+    return os.path.exists(quit_marker())
+
+
+def set_user_quit(quit_requested: bool) -> bool:
+    """Latch or clear the request.  Returns whether the state changed."""
+    try:
+        if quit_requested:
+            if user_quit():
+                return False
+            os.makedirs(os.path.dirname(quit_marker()), exist_ok=True)
+            with open(quit_marker(), "w", encoding="utf-8") as handle:
+                handle.write("The desktop pet was closed from its tray menu.\n"
+                             "Delete this file to have it come back.\n")
+            return True
+        if not user_quit():
+            return False
+        os.unlink(quit_marker())
+        return True
+    except OSError:
+        return False
+
+
 def lock_dir() -> str:
     """Where the single-instance locks live - deliberately *not* ``APP_ROOT``.
 

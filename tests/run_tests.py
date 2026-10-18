@@ -2481,6 +2481,11 @@ class TestNoDevPathDependency(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 class TestWatcher(unittest.TestCase):
+    def setUp(self):
+        # The sentinel refuses to start the pet while the user has closed it,
+        # and this machine may well have it closed.
+        isolate_quit_latch(self)
+
     def test_the_sentinel_never_imports_qt(self):
         """It has to be able to run on a machine with no Qt at all."""
         import ast
@@ -2743,6 +2748,217 @@ class TestSustainedAbsence(unittest.TestCase):
         self.assertFalse(gone.confirmed,
                          "60 polls in 6s is not 4 observations plus 6s")
 
+    def test_a_resume_is_not_mistaken_for_opencode_closing(self):
+        """The overnight failure, and the rule that prevents it.
+
+        This laptop sleeps five times an hour.  Straight after a resume the
+        process table cannot be trusted, so ``app_alive()`` returns False while
+        OpenCode is very much alive.  The debounce cannot help - the machine
+        really was unreachable for the length of the resume - so the sample has
+        to be rejected outright.
+        """
+        from petcore.liveness import AbsentConfirm, SleepWatch
+
+        watch = SleepWatch(tolerance=2.0, settle=20.0)
+        wall, mono = 1_000_000.0, 5_000.0
+        self.assertFalse(watch.update(wall, mono), "the first sample compares "
+                                                     "against nothing")
+        # Ten seconds pass normally.
+        self.assertFalse(watch.update(wall + 10.0, mono + 10.0))
+        # The machine suspends for 40 minutes; wall clock jumps, monotonic
+        # barely moves.
+        slept = watch.update(wall + 2410.0, mono + 10.05)
+        self.assertTrue(slept, "a 40-minute gap between the clocks is a sleep")
+
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        gone.update(True, 100.0)
+        # Four empty scans during the settling window must not count.
+        fake_mono = 5010.05
+        for n in range(1, 5):
+            self.assertFalse(gone.update(False, 100.0 + n * 2.0,
+                                         trust=not watch.settling_at(fake_mono
+                                                                   + n * 2.0)))
+        self.assertFalse(gone.confirmed,
+                         "a resume must not be able to close OpenCode")
+        # Once settling is over, absence counts normally again.
+        self.assertFalse(watch.settling_at(fake_mono + 60.0))
+
+    def test_an_untrusted_sample_does_not_reset_a_real_absence(self):
+        """Discarding a sample means discarding it, in both directions."""
+        from petcore.liveness import AbsentConfirm
+        gone = AbsentConfirm(grace=6.0, min_polls=4)
+        gone.update(True, 100.0)
+        gone.update(False, 102.0)
+        self.assertEqual(gone.samples, 1)
+        gone.update(True, 104.0, trust=False)
+        self.assertEqual(gone.samples, 1,
+                         "a sample we cannot trust says nothing either way")
+
+    def test_a_slow_poll_is_not_mistaken_for_a_sleep(self):
+        """Only a clock *disagreement* is a suspend, not a slow poll."""
+        from petcore.liveness import SleepWatch
+        watch = SleepWatch(tolerance=2.0)
+        wall, mono = 100.0, 100.0
+        watch.update(wall, mono)
+        # A poll that took 30 seconds of wall time also took 30 of monotonic.
+        self.assertFalse(watch.update(wall + 30.0, mono + 30.0),
+                         "30 seconds of work is not a suspend")
+        # A small, harmless discrepancy stays under the tolerance.
+        self.assertFalse(watch.update(wall + 32.0, mono + 31.0))
+
+    def test_the_sentinel_can_be_restarted_by_something_outside_it(self):
+        """The single point of failure, closed.
+
+        The sentinel used to run only at sign-in, so when it exited for any
+        reason at all the desktop stayed empty until the next logon - which is
+        exactly what happened twice.  The installer now registers a periodic
+        Windows task that re-runs the sentinel; starting it is idempotent
+        because it exits at once if the lock is already held.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "install.py"), "r", encoding="utf-8") as h:
+            source = h.read()
+        self.assertIn("schtasks", source,
+                      "the watchdog is a Windows scheduled task")
+        self.assertIn("WATCHDOG_MINUTES", source)
+        tree = ast.parse(source)
+        functions = {n.name for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef)}
+        for name in ("install_watchdog", "remove_watchdog", "watchdog_installed"):
+            self.assertIn(name, functions)
+        # Uninstall has to take it away again, or it would keep starting a pet
+        # whose files are gone.
+        uninstall = source.split("def cmd_uninstall", 1)[-1]
+        self.assertIn("remove_watchdog", uninstall)
+
+    def test_a_pet_off_the_desktop_is_brought_back(self):
+        """The reported bug, 2026-10-18: a pet that nobody could see.
+
+        It sat at x=3306 on a 2560-wide desktop - alive, unlocked, topmost,
+        and entirely outside the virtual desktop.  Its card was visible, so the
+        user saw a card with no pet, and ``install.py status`` cheerfully
+        reported a healthy installation.  ``clamp_to_screen`` would have fixed
+        it, but it only runs on restore, on scale and at the end of a drag: a
+        pet that is simply *sitting there* is never re-checked.
+
+        This drives the real geometry rather than a mock, because the whole
+        difficulty is that Qt's own answers are wrong for a window nowhere near
+        a screen - ``window.screen()`` reports the nearest screen, which is the
+        question being asked in the first place.
+        """
+        from PyQt5.QtWidgets import QApplication
+        from petui.petwindow import PetWindow
+
+        app = QApplication.instance() or QApplication(["pet-test"])
+        window = PetWindow(scale=1.0)
+        try:
+            area = QApplication.primaryScreen().availableGeometry()
+
+            window.move(area.left() + 40, area.top() + 40)
+            self.assertTrue(window.is_onscreen(),
+                            "a pet inside the desktop is on screen")
+
+            # Far outside every screen, exactly as reported.
+            window.move(area.right() + 700, area.bottom() + 100)
+            self.assertFalse(window.is_onscreen(),
+                             "a pet at x=%d on a %d-wide desktop is not on screen"
+                             % (window.x(), area.width()))
+
+            self.assertTrue(window.ensure_on_screen(),
+                            "the pet must come back on its own")
+            self.assertTrue(window.is_onscreen())
+            self.assertTrue(area.contains(window.geometry()),
+                            "and it must land somewhere visible, not merely "
+                            "nearer the edge (got %r)" % (window.geometry(),))
+
+            # Idempotent: a second call must not move a healthy pet.
+            before = window.pos()
+            self.assertFalse(window.ensure_on_screen())
+            self.assertEqual(window.pos(), before,
+                             "a visible pet must never be dragged around")
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_being_one_pixel_over_an_edge_is_not_on_screen(self):
+        """A sliver of pet on the edge is, to the user, gone."""
+        from PyQt5.QtWidgets import QApplication
+        from petui.petwindow import ONSCREEN_MARGIN_PX, PetWindow
+
+        app = QApplication.instance() or QApplication(["pet-test"])
+        window = PetWindow(scale=1.0)
+        try:
+            area = QApplication.primaryScreen().availableGeometry()
+            # Hanging off the right edge with only a sliver showing.
+            window.move(area.right() - 3, area.top() + 40)
+            self.assertFalse(window.is_onscreen(),
+                             "%d visible pixels is not 'on screen'"
+                             % ONSCREEN_MARGIN_PX)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_the_onscreen_check_runs_periodically_not_only_on_restore(self):
+        """The check has to be on a timer, or it is only a startup nicety."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "opencode_pet.py"), "r",
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("screen_timer", source,
+                      "the pet must be re-checked while it is simply running")
+        body = source.split("def keep_on_screen", 1)[-1]
+        self.assertIn("ensure_on_screen", body,
+                      "the timer has to be the thing that calls it")
+        # A rescued pet must take its cards with it, so a card is not left
+        # stranded on the far edge where the pet used to be.
+        self.assertIn("persist_pos", body,
+                      "and the new position has to be remembered")
+
+    def test_the_watchdog_command_points_at_the_installation(self):
+        import install
+        import petcore.paths as paths
+        command = install.watchdog_command(paths.opencode_config_dir() + r"\pet")
+        self.assertIn("pet_watcher.py", command)
+        self.assertIn("pythonw", command.lower())
+        # Never the directory the installer happens to be run from.
+        self.assertNotIn("Desktop", command)
+
+    def test_every_exit_path_leaves_a_trace(self):
+        """``pythonw.exe`` discards stderr, so silence used to mean nothing.
+
+        The pet and the sentinel both died with no record at all, which is how
+        this cost a whole day of guessing.  An exception on any thread, and a
+        clean exit, must all reach the log file.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("opencode_pet.py", "pet_watcher.py"):
+            with open(os.path.join(root, name), "r", encoding="utf-8") as handle:
+                source = handle.read()
+            tree = ast.parse(source)
+            hooked = set()
+            registered = False
+            for node in ast.walk(tree):
+                # sys.excepthook = ...  /  threading.excepthook = ...
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Attribute):
+                            hooked.add(target.attr)
+                # atexit.register(...)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr == "register":
+                        registered = True
+            self.assertIn("excepthook", hooked,
+                          "%s must catch uncaught main-thread exceptions" % name)
+            self.assertIn("excepthook", hooked | set(dir(__import__("threading"))),
+                          "%s" % name)
+            self.assertTrue(registered,
+                            "%s must record its own clean exit (atexit)" % name)
+
+    def setUp(self):
+        # The sentinel asks this before starting anything, and the real machine
+        # may well have the pet closed on purpose.
+        isolate_quit_latch(self)
+
     def test_the_sentinel_survives_a_poll_that_raises(self):
         """One failing poll must not be the sentinel's last act.
 
@@ -2814,6 +3030,395 @@ class TestSustainedAbsence(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+def isolate_quit_latch(case):
+    """Stop a test from seeing the real machine's "stay closed" request.
+
+    The sentinel now asks ``paths.user_quit()`` before it starts anything, which
+    is the behaviour we want and also means a test suite run on a machine where
+    the user has actually closed the pet silently changes what the sentinel
+    tests assert.  A test that depends on the developer's own settings is not a
+    test, it is a coin toss - so every test that drives the sentinel gets its
+    own empty latch.
+    """
+    import petcore.paths as paths
+    original = paths.user_quit
+    paths.user_quit = lambda: False
+    case.addCleanup(lambda: setattr(paths, "user_quit", original))
+
+
+class TestUserQuitSticks(unittest.TestCase):
+    """Exit from the tray menu has to mean exit.
+
+    The pet is restarted by the sentinel whenever it disappears, which is exactly
+    right for a crash and exactly wrong for a deliberate quit - the two were
+    indistinguishable, so choosing Exit brought the pet back about two seconds
+    later.  There was no way to make it stay gone, which made the whole Exit
+    item a lie.
+
+    So a user quit is latched, and only a start the user asked for clears it.
+    """
+
+    def setUp(self):
+        import tempfile
+        import petcore.paths as paths
+        self._folder = tempfile.mkdtemp(prefix="pet-quit-")
+        self._original = paths.opencode_config_dir
+        paths.opencode_config_dir = lambda: self._folder
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        import shutil
+        import petcore.paths as paths
+        paths.opencode_config_dir = self._original
+        shutil.rmtree(self._folder, ignore_errors=True)
+
+    def test_the_latch_is_a_file_whose_existence_is_the_whole_meaning(self):
+        from petcore import paths
+        self.assertFalse(paths.user_quit())
+        self.assertTrue(paths.set_user_quit(True))
+        self.assertTrue(paths.user_quit())
+        self.assertTrue(os.path.isfile(paths.quit_marker()))
+        self.assertTrue(paths.set_user_quit(False))
+        self.assertFalse(paths.user_quit())
+
+    def test_it_lives_in_opencodes_config_not_in_the_install_folder(self):
+        """A checkout on the Desktop and the installation must agree.
+
+        ``pet_state.json`` lives inside the application folder, so the two copies
+        have separate ones.  "I quit the pet" has to mean the pet is off, not
+        "the copy I happened to click was off".
+        """
+        from petcore import paths
+        self.assertTrue(os.path.normcase(paths.quit_marker()).startswith(
+            os.path.normcase(paths.opencode_config_dir())))
+
+    def test_the_tray_quit_latches_and_other_exits_do_not(self):
+        """Only a *user* quit may leave a 'stay off' note behind.
+
+        The pet also quits by itself when OpenCode closes.  If that wrote the
+        latch, the next sign-in would bring back a pet nobody asked to keep -
+        the opposite bug, and a worse one.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "opencode_pet.py"), "r",
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn('if reason == "user":', source,
+                      "only a user quit may latch")
+        self.assertIn("set_user_quit(True)", source)
+        # The lifecycle quit must say why, and must not say "user".
+        self.assertIn('quit_app("opencode-closed")', source)
+
+    def test_the_sentinel_tells_the_pet_who_asked_for_the_start(self):
+        """A background restart and a human running the script are not the same.
+
+        ``--from-sentinel`` is the whole mechanism: without it the pet cannot
+        tell "start the pet, it crashed" from "start the pet, I want it back",
+        and has to either always obey the latch (making the pet impossible to
+        bring back) or always ignore it (making Exit useless again).
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "pet_watcher.py"), "r",
+                  encoding="utf-8") as handle:
+            watcher = handle.read()
+        self.assertIn('args.append("--from-sentinel")', watcher,
+                      "the sentinel must mark its own launches")
+        self.assertIn("paths.user_quit()", watcher,
+                      "and must not launch the pet while the latch is set")
+
+        with open(os.path.join(root, "opencode_pet.py"), "r",
+                  encoding="utf-8") as handle:
+            pet = handle.read()
+        self.assertIn('"--from-sentinel"', pet,
+                      "the pet must accept that marker")
+        self.assertIn("args.from_sentinel", pet,
+                      "and use it to decide whether to obey the latch")
+
+    def test_the_sentinel_really_refuses_to_start_a_closed_pet(self):
+        """Driven through the real loop, not asserted from the source.
+
+        This is the behaviour the whole feature exists for: a quit that the
+        sentinel quietly undoes two seconds later is not a quit.
+        """
+        import pet_watcher
+        from petcore import paths as real_paths
+
+        launched = []
+        original_quit = real_paths.user_quit
+        original_launch = pet_watcher.launch_pet
+        original_sleep = pet_watcher.time.sleep
+        real_paths.user_quit = lambda: True
+        pet_watcher.launch_pet = lambda lang="": launched.append("launch")
+
+        class Done(Exception):
+            pass
+
+        count = {"n": 0}
+
+        def fake_sleep(_seconds):
+            count["n"] += 1
+            if count["n"] >= 6:
+                raise Done
+
+        pet_watcher.time.sleep = fake_sleep
+
+        class Args:
+            always_show = False
+            once = False
+
+        try:
+            try:
+                pet_watcher._loop(Args(), "en", clock=lambda: 1000.0 + count["n"])
+            except Done:
+                pass
+        finally:
+            real_paths.user_quit = original_quit
+            pet_watcher.launch_pet = original_launch
+            pet_watcher.time.sleep = original_sleep
+
+        self.assertEqual(launched, [],
+                         "the sentinel started the pet while the user had "
+                         "closed it - that is the bug this whole change is for")
+
+    def test_a_manual_start_clears_the_latch(self):
+        """Otherwise 'stay off' would be permanent and unrecoverable."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "opencode_pet.py"), "r",
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("set_user_quit(False)", source,
+                      "starting by hand must clear the request")
+
+    def test_reinstalling_and_enable_both_bring_the_pet_back(self):
+        import install
+        from petcore import paths
+        paths.set_user_quit(True)
+        self.assertTrue(paths.user_quit())
+        install.cmd_enable(None)
+        self.assertFalse(paths.user_quit(),
+                         "install.py enable must clear the latch")
+        # And installing clears it too, so a reinstall is never a silent no-op.
+        with open(os.path.join(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))), "install.py"),
+                "r", encoding="utf-8") as handle:
+            self.assertIn("set_user_quit(False)", handle.read())
+
+
+class TestMultipleEndpoints(unittest.TestCase):
+    """One machine, more than one OpenCode service.
+
+    The reported symptom on 2026-10-18: a conversation open in the app -
+    ``ACE离线OS-Interaction实验执行与验收``, in the OpenLoopEvolve workspace - and
+    the pet had never shown a card for it.  It was not a filter and not a
+    retention rule.  That conversation belonged to a *different* service: a
+    remote workspace reached over an SSH forward, whose sessions live on the
+    far side of that tunnel.  The pet watched exactly one endpoint and that was
+    the only one it could ever have seen.
+
+    These tests use real sockets and real HTTP, because the thing being tested
+    is precisely whether a second service is discoverable and readable.
+    """
+
+    def _serve(self, title, sessions, port_holder):
+        """A minimal stand-in for ``opencode-cli serve --service``."""
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        payload_info = json.dumps({"version": "2.0.32", "pid": port_holder[1],
+                                   "urls": [], "paths": {}}).encode()
+        payload_sessions = json.dumps({"data": sessions}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def _send(self, body):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.startswith("/api/info"):
+                    self._send(payload_info)
+                elif self.path.startswith("/api/session"):
+                    self._send(payload_sessions)
+                else:
+                    self._send(b'{"data":{}}')
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port_holder[0] = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        return "http://127.0.0.1:%d" % port_holder[0]
+
+    @staticmethod
+    def _session(session_id, title, directory):
+        stamp = 1792290000000
+        return {"id": session_id, "title": title,
+                "location": {"directory": directory},
+                "time": {"created": stamp, "updated": stamp, "idle": stamp}}
+
+    def test_discover_all_finds_more_than_one_service(self):
+        from petcore import endpoint
+        one = self._serve("local", [self._session("ses_a", "local one", "C:/work")],
+                          [0, 100])
+        two = self._serve("remote", [self._session("ses_b", "remote one", "/home/x")],
+                          [0, 200])
+        # A test server sits on an ephemeral port owned by *python*, so it is in
+        # neither the OpenCode-owned nor the tunnel-owned set.  Naming it is
+        # exactly the supported way to reach a service discovery cannot guess -
+        # and it is how a real user points the pet at a forwarded workspace.
+        self._name_endpoints(one, two)
+
+        # A non-empty password is required: discovery refuses to probe without
+        # one, which is the same rule ``discover`` has always had.
+        found = endpoint.discover_all(password="test")
+        urls = {e.url for e in found}
+        # Both are proven by /api/info, so both must come back.
+        self.assertIn(one, urls, "the first service must be found")
+        self.assertIn(two, urls,
+                      "a second service must be found too - this is the whole "
+                      "point: one endpoint is why the remote session was never "
+                      "shown")
+
+    def _name_endpoints(self, *urls):
+        previous = os.environ.get("OPENCODE_SERVER_URL")
+        os.environ["OPENCODE_SERVER_URL"] = ",".join(urls)
+        self.addCleanup(lambda: os.environ.__setitem__("OPENCODE_SERVER_URL", previous)
+                        if previous is not None
+                        else os.environ.pop("OPENCODE_SERVER_URL", None))
+
+    def test_discover_still_reports_exactly_one_endpoint(self):
+        """``discover`` is the "the one OpenCode" call; it must not change."""
+        from petcore import endpoint
+        self._serve("a", [], [0, 100])
+        self._serve("b", [], [0, 200])
+        ep, err = endpoint.discover()
+        self.assertIsNotNone(ep, "discover must still find the primary service")
+        self.assertIsInstance(ep.url, str)
+        self.assertEqual(err, "")
+
+    def test_a_session_from_a_second_service_reaches_the_pet(self):
+        """The end-to-end shape: two services, one merged set of facts."""
+        import threading
+        from petcore import endpoint, reducer
+
+        local = self._serve("local", [self._session("ses_a", "本地会话", "C:/work")],
+                            [0, 100])
+        remote = self._serve("remote", [self._session("ses_b", "远程会话", "/home/x")],
+                             [0, 200])
+        self._name_endpoints(local, remote)
+        endpoints = endpoint.discover_all(password="test")
+        self.assertGreaterEqual(len(endpoints), 2)
+
+        # Merge exactly as the observer does, then fold with the real reducer.
+        infos, origin = [], {}
+        for ep in endpoints:
+            if ep.url not in (local, remote):
+                continue
+            from petcore.client import OpenCodeClient
+            client = OpenCodeClient(endpoint=ep)
+            self.assertTrue(client.connect())
+            found = client.list_sessions(limit=40)
+            infos.extend(found)
+            for item in found:
+                if isinstance(item, dict) and item.get("id"):
+                    origin[item["id"]] = ep.url
+
+        sessions = {}
+        reducer.reconcile(sessions, {}, infos, {}, 1792290000000)
+        for session_id, record in sessions.items():
+            record["source"] = origin.get(session_id, "")
+
+        self.assertIn("ses_a", sessions, "the local session must survive")
+        self.assertIn("ses_b", sessions,
+                      "the remote session must be present too, not filtered out")
+        self.assertEqual(sessions["ses_a"]["source"], local)
+        self.assertEqual(sessions["ses_b"]["source"], remote)
+        # And the project label comes from each one's own directory, so the two
+        # cards are distinguishable on screen without any new UI.
+        self.assertEqual(sessions["ses_b"]["project"], "x")
+
+    def test_a_client_never_wanders_to_another_service(self):
+        """The bug that made multi-endpoint support impossible to trust.
+
+        ``OpenCodeClient.connect()`` used to re-run discovery and *overwrite* the
+        endpoint it had been constructed with.  With one OpenCode on the machine
+        that was invisible - discovery always found the same one.  With two, every
+        client snapped back to the first service discovered, so the client built
+        for a remote workspace read the local service's sessions, and the remote
+        conversation could never appear no matter how many endpoints were found.
+
+        A client is a handle to one endpoint.  This is the whole reason it stays
+        one.
+        """
+        from petcore.client import OpenCodeClient
+
+        local = self._serve("local", [self._session("ses_a", "local", "C:/work")],
+                            [0, 100])
+        remote = self._serve("remote", [self._session("ses_b", "remote", "/home/x")],
+                             [0, 200])
+        self._name_endpoints(local, remote)
+
+        from petcore import endpoint
+        for ep in endpoint.discover_all(password="test"):
+            if ep.url not in (local, remote):
+                continue
+            client = OpenCodeClient(endpoint=ep)
+            self.assertTrue(client.connect(), "must connect to its own endpoint")
+            self.assertEqual(client.endpoint.url, ep.url,
+                             "connect() must not replace the endpoint it was "
+                             "given with whatever discovery finds first")
+            wanted = "ses_a" if ep.url == local else "ses_b"
+            self.assertEqual([s.get("id") for s in client.list_sessions()], [wanted],
+                             "each client must read its own service's sessions")
+
+    def test_pruning_keeps_sessions_from_every_endpoint(self):
+        """The trap a multi-endport merge walks straight into.
+
+        ``prune`` keeps only the ids seen in the last poll.  Polling one endpoint
+        per cycle - or merging each endpoint's list but keeping only one list -
+        silently deletes every other endpoint's sessions on the next tick, so the
+        remote card appears for one poll and then vanishes forever.
+        """
+        from petcore import reducer
+        sessions = {}
+        reducer.reconcile(sessions, {},
+                          [self._session("ses_a", "a", "C:/a"),
+                           self._session("ses_b", "b", "/b")],
+                          {}, 1792290000000)
+        self.assertEqual(len(sessions), 2)
+        reducer.prune(sessions, keep_ids=["ses_a", "ses_b"])
+        self.assertEqual(sorted(sessions), ["ses_a", "ses_b"],
+                         "both endpoints' sessions must be kept")
+
+    def test_the_observer_can_watch_several_endpoints_at_once(self):
+        """The wiring, not just the merge."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "opencode_pet.py"), "r",
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        observer = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "Observer":
+                observer = node
+        self.assertIsNotNone(observer)
+        methods = {n.name for n in observer.body
+                   if isinstance(n, ast.FunctionDef)}
+        self.assertIn("_sync_endpoints", methods,
+                      "the observer must be able to find extra services")
+        self.assertIn("_start_stream", methods,
+                      "each service needs its own event stream")
+        body = ast.dump(observer)
+        self.assertIn("clients", body,
+                      "and more than one client has to be kept")
+
+
 class TestOneInstallationOnly(unittest.TestCase):
     """The pet lives in OpenCode's config, and only there.
 

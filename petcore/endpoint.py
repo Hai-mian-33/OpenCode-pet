@@ -86,6 +86,19 @@ def read_password(path: str = None) -> str:
     return ""
 
 
+# Processes that may own a *forwarded* port for a remote workspace.  A remote
+# OpenCode reached over SSH is exposed on localhost by an ``ssh -L`` forward,
+# and that socket belongs to ``ssh.exe`` - not to any OpenCode process.  So a
+# scan that only looks at OpenCode's own listeners can never find a remote
+# workspace, which is exactly the conversation a user most wants to see.
+TUNNEL_PROCESS_NAMES = ("ssh.exe", "ssh", "pageant.exe", "putty.exe", "plink.exe")
+
+# Ports a forwarded remote workspace commonly lands on.  Probing these costs
+# one short HTTP request each and is the difference between "the pet cannot
+# see remote workspaces" and "it can".
+TUNNEL_FALLBACK_PORTS = (59471, 49374, 59102)
+
+
 # ---------------------------------------------------------------------------
 # validation
 # ---------------------------------------------------------------------------
@@ -214,27 +227,34 @@ def _listening_ports_netstat(pids: Iterable[int]) -> List[int]:
 # discovery
 # ---------------------------------------------------------------------------
 def _env_endpoints() -> List[str]:
+    """Endpoints named in the environment.
+
+    ``OPENCODE_SERVER_URL`` accepts a **list**, separated by commas, semicolons
+    or whitespace.  That is what makes a remote workspace reachable when its
+    tunnel port is not one this module would guess: the user (or a launcher) can
+    simply say which ports to ask.  Discovery still *proves* every one of them
+    with ``/api/info``, so a wrong entry costs a refused connection and nothing
+    more.
+    """
     urls = []
     explicit = os.environ.get("OPENCODE_SERVER_URL") or os.environ.get("OPENCODE_URL")
     if explicit:
-        urls.append(explicit if "//" in explicit else "http://" + explicit)
+        for part in re.split(r"[,;\s]+", explicit.strip()):
+            if part:
+                urls.append(part if "//" in part else "http://" + part)
     port = os.environ.get("OPENCODE_PORT") or os.environ.get("OPENCODE_SERVER_PORT")
     if port and port.isdigit():
         urls.append("http://127.0.0.1:%s" % port)
     return urls
 
 
-def discover(cached: str = "", password: str = None) -> Tuple[Optional[Endpoint], str]:
-    """Find the service.  Returns ``(endpoint, error_key)``.
+def _candidate_urls(cached: str = "", include_tunnels: bool = True) -> List[str]:
+    """Every URL worth asking, in descending order of confidence.
 
-    ``error_key`` is ``""`` on success, otherwise an i18n key so the caller can
-    render the reason in the right language.
+    ``cached`` and the environment come first so the common case - one local
+    service - costs exactly what it always cost.  The tunnel ports come last
+    because they only exist for remote workspaces and each one costs a probe.
     """
-    if password is None:
-        password = read_password()
-    if not password:
-        return None, "err.no_password"
-
     candidates: List[str] = []
     if cached:
         candidates.append(cached if "//" in cached else "http://" + cached)
@@ -242,7 +262,70 @@ def discover(cached: str = "", password: str = None) -> Tuple[Optional[Endpoint]
     candidates.extend("http://127.0.0.1:%d" % p
                       for p in _listening_ports(_pids_named(SERVICE_PROCESS_NAMES)))
     candidates.extend("http://127.0.0.1:%d" % p for p in FALLBACK_PORTS)
+    if include_tunnels:
+        candidates.extend("http://127.0.0.1:%d" % p
+                          for p in _listening_ports(_pids_named(TUNNEL_PROCESS_NAMES)))
+        candidates.extend("http://127.0.0.1:%d" % p for p in TUNNEL_FALLBACK_PORTS)
+    return candidates
 
+
+def discover_all(cached: str = "", password: str = None,
+                 include_tunnels: bool = True) -> List[Endpoint]:
+    """Find **every** OpenCode service reachable from this machine.
+
+    ``discover`` stops at the first endpoint that validates, which is right when
+    there is only ever one.  But OpenCode can host more than one at a time: a
+    remote workspace reached over SSH is exposed on localhost by the tunnel's
+    own forward, and it holds a completely separate set of sessions.  Stopping
+    at the first hit makes those conversations invisible to the pet - the
+    reported symptom, where a session was plainly open in the app and the pet
+    had never heard of it.
+
+    Order is meaningful: ``cached`` first, so with a single endpoint the result
+    is identical to what :func:`discover` has always returned, and no extra
+    probes are made once a high-confidence candidate answers.
+    """
+    if password is None:
+        password = read_password()
+    if not password:
+        return []
+
+    found: List[Endpoint] = []
+    seen = set()
+    candidates = _candidate_urls(cached, include_tunnels)
+    # Speculative candidates - guessed ports, other people's listeners - get a
+    # much shorter deadline than the cached one.  The cached endpoint is the one
+    # we already know works, so it deserves to wait; the rest exist in the hope
+    # that one answers, and a port that accepts a connection but never replies
+    # must not hold the pet's poll loop for a second.
+    for index, url in enumerate(candidates):
+        url = url.rstrip("/")
+        if url in seen:
+            continue
+        seen.add(url)
+        endpoint = probe(url, password, timeout=1.2 if index == 0 else 0.35)
+        if endpoint and endpoint.url not in {e.url for e in found}:
+            found.append(endpoint)
+    return found
+
+
+def discover(cached: str = "", password: str = None) -> Tuple[Optional[Endpoint], str]:
+    """Find the service.  Returns ``(endpoint, error_key)``.
+
+    ``error_key`` is ``""`` on success, otherwise an i18n key so the caller can
+    render the reason in the right language.
+
+    The *primary* endpoint is the first one ``discover_all`` finds, which is the
+    same one this function has always returned.  Additional endpoints - remote
+    workspaces - are found by :func:`discover_all` and are deliberately not
+    reported here, so nothing that depends on "the one endpoint" changes.
+    """
+    if password is None:
+        password = read_password()
+    if not password:
+        return None, "err.no_password"
+
+    candidates: List[str] = _candidate_urls(cached, include_tunnels=False)
     seen = set()
     for url in candidates:
         url = url.rstrip("/")

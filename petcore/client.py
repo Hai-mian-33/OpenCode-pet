@@ -17,7 +17,7 @@ import urllib.request
 from typing import Any, Callable, Dict, Iterator, Optional
 
 from . import paths
-from .endpoint import Endpoint, discover, read_password
+from .endpoint import Endpoint, discover, probe, read_password
 
 # Reconnect backoff, seconds.  The stream is volatile by contract, so we never
 # give up - we just back off and let the reconciler fill in whatever we missed.
@@ -39,10 +39,31 @@ class OpenCodeClient:
         return self.endpoint.version if self.endpoint else ""
 
     def connect(self, cached: str = "") -> bool:
-        endpoint, error = discover(cached=cached, password=read_password() or None)
-        self.endpoint = endpoint
-        self.connected = bool(endpoint)
-        self.last_error = error
+        """Attach to an endpoint, discovering one only if we have none.
+
+        This used to always re-run discovery and overwrite ``self.endpoint``,
+        which was invisible while there was a single OpenCode on the machine -
+        discovery always found the same one - and fatal the moment there were
+        two.  Every client would silently snap back to the *first* service
+        discovered, so a client built for a remote workspace would read the
+        local service's sessions instead of its own, and the remote
+        conversation would never appear.  A client is a handle to *one*
+        endpoint; it must not wander off to another.
+        """
+        if self.endpoint is None:
+            endpoint, error = discover(cached=cached, password=read_password() or None)
+            self.endpoint = endpoint
+            self.last_error = error
+        else:
+            self.last_error = ""
+            # A handle handed to us may be stale (the service restarted on a new
+            # port).  Prove it still answers before claiming to be connected.
+            if probe(self.endpoint.url, self.endpoint.password,
+                     timeout=self.timeout) is None:
+                self.connected = False
+                self.last_error = "err.no_endpoint"
+                return False
+        self.connected = bool(self.endpoint)
         return self.connected
 
     # -- request helpers --------------------------------------------------

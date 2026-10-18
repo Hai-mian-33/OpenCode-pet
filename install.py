@@ -168,6 +168,78 @@ def remove_launcher() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# the watchdog: the one thing that makes the sentinel recoverable
+# ---------------------------------------------------------------------------
+WATCHDOG_TASK = "OpenCode Pet Sentinel"
+WATCHDOG_MINUTES = 3
+
+
+def _schtasks(*args: str):
+    """Run ``schtasks`` quietly; never raise.
+
+    The watchdog is an improvement, not a requirement: a machine that refuses
+    to create a scheduled task (a locked-down policy, a stripped edition) must
+    still get a working pet, so every failure here is reported and swallowed.
+    """
+    flags = 0x08000000 if os.name == "nt" else 0     # CREATE_NO_WINDOW
+    try:
+        return subprocess.run(["schtasks", *args], capture_output=True,
+                              text=True, timeout=30, creationflags=flags)
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def watchdog_command(root: str) -> str:
+    """The one-liner the scheduled task runs.
+
+    Starting the sentinel is idempotent: it takes the shared lock and exits
+    immediately if another copy already holds it.  So the watchdog can run
+    every few minutes unconditionally and cost nothing when everything is
+    healthy - which is the only shape that actually heals, because a watchdog
+    that has to decide whether to act has to be right every time, and this one
+    only has to be *called*.
+    """
+    script = os.path.join(root, "pet_watcher.py")
+    return '"%s" "%s"' % (paths.pythonw(), script)
+
+
+def install_watchdog(root: str) -> bool:
+    """Register a periodic task that keeps the sentinel alive.
+
+    The sentinel was started once, at sign-in, and nothing ever restarted it.
+    That made it a single point of failure: the moment it exited - for any
+    reason at all, including a hard crash it could not report - the desktop
+    stayed empty until the user logged out and back in.  This happened twice.
+
+    A periodic task removes that whole failure class, whatever the underlying
+    cause turns out to be.  It is deliberately independent of the pet, of the
+    sentinel and of anything this project writes at runtime: Windows runs it.
+    """
+    result = _schtasks(
+        "/Create", "/TN", WATCHDOG_TASK,
+        "/TR", watchdog_command(root),
+        "/SC", "MINUTE", "/MO", str(WATCHDOG_MINUTES),
+        "/F")
+    if result is None or result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() if result else ""
+        print("  ! could not register the watchdog task: %s" % (detail or "?"))
+        print("    the pet still works, but nothing will restart the sentinel "
+              "if it dies")
+        return False
+    return True
+
+
+def remove_watchdog() -> bool:
+    result = _schtasks("/Delete", "/TN", WATCHDOG_TASK, "/F")
+    return bool(result is not None and result.returncode == 0)
+
+
+def watchdog_installed() -> bool:
+    result = _schtasks("/Query", "/TN", WATCHDOG_TASK)
+    return bool(result is not None and result.returncode == 0)
+
+
+# ---------------------------------------------------------------------------
 # processes
 # ---------------------------------------------------------------------------
 def _is_our_pet(proc, target: str) -> bool:
@@ -289,6 +361,13 @@ def cmd_install(args) -> int:
     print("  source : %s" % SOURCE_ROOT)
     print("  target : %s" % destination)
 
+    # Installing is a request for the pet, so it clears any earlier "stay off".
+    # Otherwise reinstalling after a deliberate quit would leave the user
+    # staring at an installation that never shows anything, with no indication
+    # why.
+    if paths.set_user_quit(False):
+        print("  cleared the earlier 'stay closed' request")
+
     if os.path.abspath(destination) == os.path.abspath(SOURCE_ROOT):
         print("  ! already running from the install location; nothing to copy")
     else:
@@ -305,6 +384,13 @@ def cmd_install(args) -> int:
     else:
         path = write_launcher(destination)
         print("  autostart : %s" % path)
+
+    if args.no_autostart:
+        remove_watchdog()
+        print("  watchdog  : removed")
+    elif install_watchdog(destination):
+        print("  watchdog  : %s (every %d min, keeps the sentinel alive)"
+              % (WATCHDOG_TASK, WATCHDOG_MINUTES))
 
     if args.no_start:
         print("  started   : no (--no-start)")
@@ -324,6 +410,10 @@ def cmd_uninstall(args) -> int:
         print("  launcher : removed")
     else:
         print("  launcher : not present")
+    if remove_watchdog():
+        print("  watchdog : removed")
+    else:
+        print("  watchdog : not present")
     if args.keep_files:
         print("  files    : kept at %s (--keep-files)" % destination)
     elif os.path.isdir(destination):
@@ -344,6 +434,12 @@ def cmd_status(_args) -> int:
     print("  install dir   : %s" % destination)
     print("  entry point   : %s" % ("present" if os.path.isfile(entry) else "MISSING"))
     print("  autostart     : %s" % (launcher if os.path.isfile(launcher) else "off"))
+    print("  user closed   : %s"
+          % ("YES - it will stay closed (delete %s to bring it back)"
+             % paths.quit_marker() if paths.user_quit() else "no"))
+    print("  watchdog      : %s"
+          % ("%s (every %d min)" % (WATCHDOG_TASK, WATCHDOG_MINUTES)
+             if watchdog_installed() else "OFF - the sentinel will not recover"))
     print("  state file    : %s" % os.path.join(destination, "pet_state.json"))
     print("  settings file : %s" % paths.settings_file())
     try:
@@ -352,6 +448,40 @@ def cmd_status(_args) -> int:
                                        else "not running"))
     except Exception:                                      # noqa: BLE001
         pass
+    return 0
+
+
+def cmd_enable(_args) -> int:
+    """Bring the pet back after a deliberate quit.
+
+    The counterpart to the tray's Exit, and the one a person can actually find.
+    Clearing the latch is not enough on its own if the pet was not running when
+    the request was made, so the sentinel is started the same way sign-in would
+    - it will start the pet within a poll or two.
+    """
+    changed = paths.set_user_quit(False)
+    print("OpenCode Pet is welcome back"
+          if changed else "the pet was not closed - nothing to change")
+    root = target_root()
+    if os.path.isfile(os.path.join(root, "pet_watcher.py")):
+        print("  started   : %s" % ("yes" if start_now(root) else "no"))
+    else:
+        print("  not installed yet - run: python install.py install")
+    return 0
+
+
+def cmd_disable(_args) -> int:
+    """Close the pet and keep it closed, the same as the tray's Exit.
+
+    Useful for stopping it without a right-click, and for stopping it in a way
+    that survives: no watchdog tick, no sign-in and no relaunch will bring it
+    back, because the sentinel checks this before it ever starts anything.
+    """
+    print("OpenCode Pet will stay closed")
+    print("  stopped   : %d process(es)" % stop_running())
+    paths.set_user_quit(True)
+    print("  marker    : %s" % paths.quit_marker())
+    print("\nBring it back with:  python install.py enable")
     return 0
 
 
@@ -369,6 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
     remove.set_defaults(func=cmd_uninstall)
     status = sub.add_parser("status", help="show what is installed")
     status.set_defaults(func=cmd_status)
+    sub.add_parser("enable",
+                   help="bring the pet back after a deliberate quit"
+                   ).set_defaults(func=cmd_enable)
+    sub.add_parser("disable",
+                   help="close the pet and keep it closed"
+                   ).set_defaults(func=cmd_disable)
     return parser
 
 

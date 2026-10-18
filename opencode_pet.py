@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from petcore import __version__, bridge as bridge_mod, client as client_mod
 from petcore import endpoint as endpoint_mod
 from petcore import i18n, paths, reducer
-from petcore.liveness import AbsentConfirm
+from petcore.liveness import AbsentConfirm, SleepWatch
 from petcore.reducer import DONE, ERROR, IDLE, OFFLINE, WAITING
 from petcore.settings import Settings
 
@@ -73,20 +73,70 @@ def log(message: str) -> None:
 
 
 def install_crash_handler() -> None:
-    """Write a native crash - a Qt segfault, not a Python exception - to the log.
+    """Make every way this process can die leave a trace.
 
-    The sentinel relaunches the pet whenever it disappears, so a hard crash
-    looks exactly like a harmless restart.  Without this the log shows the new
-    process starting and nothing about why the old one died.
+    The pet relaunches itself whenever it disappears, so a crash looks exactly
+    like a harmless restart - and on 2026-10-18 the pet died twice with *no*
+    evidence at all, which cost hours of guessing.  The reason is worth stating
+    plainly, because it is not obvious:
+
+    **The pet runs under ``pythonw.exe``, which has no console and discards
+    stderr.**  So an uncaught Python exception - in the main thread or in any
+    of the five worker threads - was printed into a black hole.  ``faulthandler``
+    only covers *native* faults (segfault, abort), and it cannot print at all
+    when the stack it would have to walk is the thing that broke.  A hard crash
+    from a corrupted Win32 call stack therefore produced no output whatsoever,
+    which is precisely what happened here.
+
+    Four things are armed, cheapest first:
+
+    1. ``sys.excepthook`` - an uncaught exception on the main thread.
+    2. ``threading.excepthook`` - the same on any worker thread.  Without this
+       a dead thread is completely silent, and the pet limps on without it.
+    3. ``atexit`` - a *clean* exit that nobody thought to log, which is how a
+       silent ``sys.exit()`` or a stray ``return`` disappears.
+    4. ``faulthandler`` - native faults, as before.
     """
     import faulthandler
+
+    def _report(what: str, text: str) -> None:
+        try:
+            log("%s:\n%s" % (what, text))
+        except Exception:                                  # noqa: BLE001
+            pass
+
+    def excepthook(kind, value, tb) -> None:
+        import traceback
+        _report("UNCAUGHT EXCEPTION on the main thread",
+                "".join(traceback.format_exception(kind, value, tb)))
+
+    def thread_excepthook(args) -> None:
+        import traceback
+        _report("UNCAUGHT EXCEPTION on thread %r" % (getattr(args.thread,
+                                                              "name"),),
+                "".join(traceback.format_exception(args.exc_type, args.exc_value,
+                                                   args.exc_traceback)))
+
+    def atexit_report() -> None:
+        _report("process is exiting (atexit)", "the interpreter is shutting down")
+
+    sys.excepthook = excepthook
+    try:
+        import threading
+        threading.excepthook = thread_excepthook
+    except Exception:                                      # noqa: BLE001
+        pass
+    import atexit
+    atexit.register(atexit_report)
+
     try:
         handle = open(os.path.join(paths.state_dir(), "crash.log"), "a",
                       encoding="utf-8")
     except OSError:
+        log("crash handler armed (log file unavailable)")
         return
     faulthandler.enable(file=handle, all_threads=True)
-    log("crash handler armed -> state\\crash.log")
+    log("crash handler armed -> crash.log + excepthook + thread hook + atexit")
 
 
 def now_ms() -> int:
@@ -104,6 +154,13 @@ LIVENESS_INTERVAL_S = 0.02
 # loop is left free to act on the things that are urgent - above all, hiding a
 # card the moment the OpenCode window goes.
 REFRESH_COALESCE_S = 0.12
+
+# How often to look for *additional* OpenCode services.  Discovery walks the
+# process table and probes ports, which is far too expensive for the 2.5 s poll
+# that already reads every session.  Endpoints come and go rarely - a remote
+# workspace is opened or closed - so a slow re-check still picks one up within a
+# second or two of the conversation appearing, and costs nothing in between.
+REDISCOVER_EVERY_S = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +192,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print resolved paths and the discovered endpoint")
     parser.add_argument("--allow-multiple", action="store_true",
                         help="do not take the single-instance lock (debugging)")
+    parser.add_argument("--from-sentinel", action="store_true",
+                        help="internal: this start was requested by pet_watcher, "
+                             "not by the user. A start the user asked for always "
+                             "wins over a previous 'stay off' request.")
     parser.add_argument("--log-file", default=None)
     return parser
 
@@ -186,6 +247,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     paths.ensure_dirs()
     global _LOG_PATH
     _LOG_PATH = args.log_file or paths.log_file()
+
+    # "I closed it, so leave it closed."
+    #
+    # The pet used to be restarted by the sentinel whenever it disappeared, which
+    # is exactly right for a crash and exactly wrong for a deliberate quit: the
+    # two were indistinguishable, so choosing Exit from the tray brought the pet
+    # back two seconds later and there was no way to make it stay gone.
+    #
+    # So a quit the user asked for is latched, and only a start the user asked
+    # for clears it.  ``--from-sentinel`` is how the two are told apart: the
+    # sentinel passes it, a human running ``opencode_pet.py`` (or
+    # ``scripts\run_pet.cmd``) does not.  This check happens *before* the lock is
+    # taken and before Qt exists, so a pet that should stay off costs nothing.
+    if paths.user_quit() and not (args.always_show or args.demo
+                                  or args.selftest or args.doctor
+                                  or args.allow_multiple):
+        if args.from_sentinel:
+            log("the user closed the pet previously; staying down")
+            return 0
+        # Started by hand: that is the user asking for it back.
+        if paths.set_user_quit(False):
+            log("started by hand - the earlier 'stay off' request is cleared")
 
     # One pet, one set of windows.  A duplicate is refused before any Qt window
     # exists, so the loser never paints anything.
@@ -283,6 +366,17 @@ class Observer:
         self.connected = False
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
+        # One client per OpenCode service this machine can reach.  Usually there
+        # is exactly one - the local ``opencode-cli serve --service`` - and then
+        # this holds a single entry and nothing else behaves differently.  But
+        # OpenCode can also host a *remote workspace*, reached over an SSH
+        # forward, and that service keeps an entirely separate set of sessions.
+        # Watching only the first endpoint found made those conversations
+        # invisible: the session was plainly open in the app and the pet had
+        # never heard of it.
+        self.clients: Dict[str, client_mod.OpenCodeClient] = {}
+        self._stream_threads: Dict[str, threading.Thread] = {}
+        self._discovered_at = 0.0
         self._lock = threading.RLock()
         self._dirty = False
         self._ack_restored = False
@@ -345,7 +439,6 @@ class Observer:
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
         self._threads = [
-            threading.Thread(target=self._stream_loop, name="pet-events", daemon=True),
             threading.Thread(target=self._poll_loop, name="pet-poll", daemon=True),
             threading.Thread(target=self._liveness_loop, name="pet-liveness",
                              daemon=True),
@@ -357,15 +450,40 @@ class Observer:
     def stop(self) -> None:
         self._stop.set()
         self._wake_poll.set()          # release the poll thread immediately
-        self.client.reconnect()
+        with self._lock:
+            clients = list(self.clients.values())
+        for client in clients:
+            try:
+                client.reconnect()
+            except Exception:                              # noqa: BLE001
+                pass
 
     # -- threads ----------------------------------------------------------
-    def _stream_loop(self) -> None:
-        for event in self.client.events(self._stop):
+    def _stream_loop(self, url: str = "") -> None:
+        """Read one endpoint's event stream.
+
+        One thread per endpoint.  ``url`` is empty for the legacy single-endpoint
+        case, where the primary client is used - so this keeps working no matter
+        how many endpoints there are, including none.
+        """
+        while not self._stop.is_set():
+            client = self.clients.get(url) if url else self.client
+            if client is None:
+                if self._stop.wait(1.0):
+                    break
+                continue
+            try:
+                for event in client.events(self._stop):
+                    if self._stop.is_set():
+                        break
+                    self._apply(event, url)
+            except Exception as exc:                       # noqa: BLE001
+                log("event stream from %s failed: %r" % (url or "primary", exc))
             if self._stop.is_set():
                 break
-            self._apply(event)
-        log("event stream ended")
+            if self._stop.wait(1.0):
+                break
+        log("event stream ended (%s)" % (url or "primary"))
 
     def _liveness_loop(self) -> None:
         """Watch the OpenCode window closely, and say so only when it changes.
@@ -410,19 +528,100 @@ class Observer:
             self._wake_poll.wait(2.5)
 
     # -- folding ----------------------------------------------------------
-    def _apply(self, event: Dict) -> None:
+    def _apply(self, event: Dict, url: str = "") -> None:
         kind = event.get("type") or ""
         with self._lock:
-            if not self.client.connected:
-                self.client.connected = True
             if kind == "server.connected":
-                self.version = self._version_from_client()
+                if url:
+                    self.version = self._version_from(url) or self.version
+                else:
+                    self.version = self._version_from_client()
                 self._publish_status()
                 return
             reducer.apply_event(self.sessions, event, now_ms())
+            session_id = event.get("data", {}).get("sessionID")
+            if url and session_id:
+                # Remember where this session lives, so a card from a remote
+                # workspace can be told apart from a local one.
+                record = self.sessions.get(session_id)
+                if record is not None:
+                    record["source"] = url
             if kind in ("session.idle", "session.error", "session.tool.failed"):
-                self._notice_locked(self.sessions.get(event.get("data", {}).get("sessionID")))
+                self._notice_locked(self.sessions.get(session_id))
             self._dirty = True
+
+    def _version_from(self, url: str) -> str:
+        client = self.clients.get(url)
+        if client is None:
+            return ""
+        try:
+            return str(client.info().get("version") or "")
+        except Exception:                                  # noqa: BLE001
+            return str(getattr(client, "version", "") or "")
+
+    def _sync_endpoints(self) -> None:
+        """Keep ``self.clients`` in step with the services that actually exist.
+
+        Re-discovery is *not* done on every poll: it walks the process table and
+        probes ports, which is far too expensive for a 2.5 s loop that already
+        reads every session.  Endpoint churn is rare - a workspace is opened or
+        closed - so a slow re-check catches it within a second or two of the
+        conversation appearing.
+        """
+        now = time.time()
+        if self._discovered_at and (now - self._discovered_at) < REDISCOVER_EVERY_S:
+            return
+        self._discovered_at = now
+        try:
+            found = endpoint_mod.discover_all(self.settings.get("endpoint") or "")
+        except Exception as exc:                           # noqa: BLE001
+            log("endpoint discovery failed: %r" % (exc,))
+            return
+
+        urls = {e.url for e in found}
+        added, removed = [], []
+        with self._lock:
+            for endpoint in found:
+                if endpoint.url in self.clients:
+                    continue
+                client = client_mod.OpenCodeClient(endpoint=endpoint)
+                if not client.connect():
+                    continue
+                self.clients[endpoint.url] = client
+                added.append(endpoint)
+            for url in list(self.clients):
+                if url not in urls:
+                    removed.append(url)
+                    self.clients.pop(url, None)
+
+        for endpoint in added:
+            log("watching %s (v%s, pid %s)"
+                % (endpoint.url, endpoint.version, endpoint.pid))
+            self._start_stream(endpoint.url)
+        for url in removed:
+            log("endpoint %s is gone; dropping it" % url)
+            self._stop_stream(url)
+
+        if (added or removed):
+            # A new or departed service changes the status line, so publish it
+            # through the one method that knows the callback's signature.
+            self._publish_status()
+
+    def _start_stream(self, url: str) -> None:
+        thread = threading.Thread(target=self._stream_loop, args=(url,),
+                                  name="pet-events", daemon=True)
+        self._stream_threads[url] = thread
+        thread.start()
+
+    def _stop_stream(self, url: str) -> None:
+        self._stream_threads.pop(url, None)
+        client = self.clients.get(url)
+        if client is not None:
+            # Breaks the blocking read so the thread can actually finish.
+            try:
+                client.reconnect()
+            except Exception:                              # noqa: BLE001
+                pass
 
     def _reconcile(self) -> None:
         # Liveness *first*, before the API calls below.  Those take long enough
@@ -431,37 +630,72 @@ class Observer:
         # this pass would record "waiting for authorization" under a window that
         # had already gone.
         self.liveness(max_age_ms=0)
-        cached = self.settings.get("endpoint") or ""
-        if not self.client.connected or self.client.endpoint is None:
-            if not self.client.connect(cached=cached):
-                with self._lock:
-                    if self.connected:
-                        self.connected = False
-                        self._publish_status()
-                    self._mark_all_idle()
-                self._stop.wait(3.0)
-                return
-            self.settings.set("endpoint", self.client.endpoint.url)
-            self.version = self.client.version
-            log("connected to %s (v%s, pid %s)" % (self.client.endpoint.url,
-                                                  self.client.version,
-                                                  self.client.endpoint.pid))
+        self._sync_endpoints()
+
+        with self._lock:
+            clients = list(self.clients.values())
+            primary = clients[0] if clients else None
+        # Backwards-compatible handle for everything that wants "the" client.
+        self.client = primary
+        if primary is None:
+            with self._lock:
+                if self.connected:
+                    self.connected = False
+                    self._publish_status()
+                self._mark_all_idle()
+            self._stop.wait(3.0)
+            return
+
+        if not self.settings.get("endpoint"):
+            self.settings.set("endpoint", primary.endpoint.url)
+        self.version = primary.version
+
+        # Merge every endpoint into one set of facts.  The reducer is
+        # deliberately source-agnostic and session ids are unique per server, so
+        # folding them together is what lets a card from a remote workspace sit
+        # beside a card from the local one.
+        infos: List[Dict] = []
+        active: Dict[str, Dict] = {}
+        permissions: Dict[str, Any] = {}
+        origin: Dict[str, str] = {}
+        any_connected = False
+        for client in clients:
+            try:
+                if not client.connected and not client.connect():
+                    continue
+                url = client.endpoint.url if client.endpoint else ""
+                found = client.list_sessions(limit=40)
+                live = client.active_sessions()
+                for session_id in list(live)[:12]:
+                    # Record every polled session, empty list included: that is
+                    # how the reducer learns an approval request was answered.
+                    permissions[session_id] = client.pending_permissions(session_id)
+                any_connected = True
+            except Exception as exc:                       # noqa: BLE001
+                log("poll against %s failed: %r" % (client.endpoint, exc))
+                continue
+            infos.extend(found)
+            for session_id, record in live.items():
+                active[session_id] = record
+                origin[session_id] = url
+            for item in found:
+                if isinstance(item, dict) and item.get("id"):
+                    origin.setdefault(item["id"], url)
+
         with self._lock:
             was_connected = self.connected
-            self.connected = self.client.connected
+            self.connected = any_connected
             if self.connected and not was_connected:
                 self._publish_status()
 
-            infos = self.client.list_sessions(limit=40)
-            active = self.client.active_sessions()
-            permissions = {}
-            for session_id in list(active)[:12]:
-                # Record every polled session, empty list included: that is how
-                # the reducer learns an approval request was answered.
-                permissions[session_id] = self.client.pending_permissions(session_id)
             reducer.reconcile(self.sessions, active, infos, permissions, now_ms())
             reducer.prune(self.sessions,
                           keep_ids=[s.get("id") for s in infos if isinstance(s, dict)])
+            # Remember which service each session came from, so a card can say so
+            # once there is more than one.  With a single endpoint this is the
+            # local one every time and nothing is shown differently.
+            for session_id, record in self.sessions.items():
+                record["source"] = origin.get(session_id, "")
             # Re-apply what has already been read.  Without this the session list
             # comes back from the API with acknowledged=False on every start, and
             # every finished task the user had already dismissed appears again.
@@ -657,6 +891,8 @@ def run_app(args, settings: Settings) -> int:
     # Sustained-absence latch, shared with the sentinel's rule.  See
     # ``petcore/liveness.py``.
     gone = AbsentConfirm()
+    # Suspend detector, so a resume is not mistaken for OpenCode closing.
+    sleep_watch = SleepWatch()
     last_app_open = True
     refresh_at = [0.0]
     demo_stop = threading.Event()
@@ -767,12 +1003,27 @@ def run_app(args, settings: Settings) -> int:
         box.setIcon(QMessageBox.Information)
         box.exec_()
 
-    def quit_app() -> None:
+    def quit_app(reason: str = "quit") -> None:
+        """Close the pet.
+
+        ``reason`` is ``"user"`` when the tray's Exit was chosen, and anything
+        else for the exits the pet decides for itself.  Only a *user* quit latches
+        "stay off": the pet must not write a "leave me alone" note when it quits
+        because OpenCode closed, or the next sign-in would bring back a pet
+        nobody asked to keep.
+        """
         nonlocal quit_requested
         if quit_requested:
             return
         quit_requested = True
-        log("quitting")
+        if reason == "user":
+            if paths.set_user_quit(True):
+                log("quit from the tray menu - the pet will stay closed "
+                    "(delete %s to bring it back)" % paths.quit_marker())
+            else:
+                log("quit from the tray menu")
+        else:
+            log("quitting (%s)" % reason)
         if observer is not None:
             observer.stop()
         if event_bridge is not None:
@@ -999,6 +1250,17 @@ def run_app(args, settings: Settings) -> int:
         nonlocal app_seen
         if not settings.get("follow_app"):
             return
+
+        # Did the machine suspend since the last look?  This laptop sleeps five
+        # times an hour, and straight after a resume the process table cannot be
+        # trusted - the scan can come back empty while OpenCode is perfectly
+        # alive.  Detecting the suspend is what stops that from being read as
+        # "OpenCode has closed".  See ``petcore/liveness.py``.
+        if sleep_watch.update():
+            log("the machine was asleep; not trusting process scans for %.0fs"
+                % sleep_watch.settle)
+        trust = not sleep_watch.settling
+
         # Watch OpenCode as a whole, not just its window.  Closing the window
         # leaves ``opencode-cli serve --service`` running with every session
         # intact, and the pet is then the only way back into the closed app -
@@ -1012,12 +1274,12 @@ def run_app(args, settings: Settings) -> int:
         # runs at sign-in - so absence has to be sustained first.  This is the
         # same rule the sentinel uses, from the same class, so the two halves
         # cannot disagree about how long "long enough" is.
-        if gone.update(alive):
+        if gone.update(alive, trust=trust):
             if app_seen:
                 app_seen = False
                 log("OpenCode and its background service are both gone: %s"
                     % i18n.t("cli.daemon_exit"))
-                quit_app()
+                quit_app("opencode-closed")
         elif alive and not app_seen:
             app_seen = True
             log("OpenCode detected; pet is up")
@@ -1026,7 +1288,7 @@ def run_app(args, settings: Settings) -> int:
         """Read by the tray every time the menu opens, so it is never stale."""
         return {
             "open": open_desktop,
-            "quit": quit_app,
+            "quit": lambda: quit_app("user"),
             "about": show_about,
             "demo": start_demo,
             "reset_pos": reset_pos,
@@ -1174,6 +1436,29 @@ def run_app(args, settings: Settings) -> int:
     life_timer.start(2000)
     lifecycle()
 
+    # Keep the pet where the user can see it.
+    #
+    # The reported bug on 2026-10-18 was a pet at x=3306 on a 2560-wide desktop:
+    # alive, unlocked, topmost, and completely invisible.  ``clamp_to_screen``
+    # already existed and would have fixed it - but it only runs on restore, on
+    # scale and at the end of a drag, so a pet that is simply sitting there is
+    # never re-checked.  Undocking a second monitor, or a resolution change,
+    # strands it with no way back except dragging a window you cannot see.
+    #
+    # One second is frequent enough that a stranded pet returns before the user
+    # can miss it, and cheap enough to be irrelevant: a handful of integer
+    # comparisons against already-cached screen geometry.
+    def keep_on_screen() -> None:
+        if window.ensure_on_screen():
+            log("the pet had drifted off the desktop; brought it back to (%d, %d)"
+                % (window.x(), window.y()))
+            persist_pos()
+
+    screen_timer = QTimer()
+    screen_timer.timeout.connect(keep_on_screen)
+    screen_timer.start(1000)
+    keep_on_screen()
+
     observer.start()
     if args.demo:
         start_demo()
@@ -1181,7 +1466,18 @@ def run_app(args, settings: Settings) -> int:
     app.aboutToQuit.connect(observer.stop)
 
     try:
-        return app.exec_()
+        code = app.exec_()
+        log("Qt event loop returned normally (code %r)" % (code,))
+        return code
+    except BaseException as exc:                           # noqa: BLE001
+        # Last line of defence.  Anything raised out of the event loop is
+        # otherwise indistinguishable from a crash: the sentinel simply
+        # relaunches the pet and the log shows a clean start.
+        import traceback
+        log("EXCEPTION OUT OF THE Qt EVENT LOOP: %r\n%s"
+            % (exc, "".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))))
+        raise
     finally:
         observer.stop()
         if event_bridge is not None:

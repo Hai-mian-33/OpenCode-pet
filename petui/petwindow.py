@@ -18,6 +18,7 @@ from petui.openo import BASE_H, BASE_W, DESIGN_H, DESIGN_W, OpenO
 
 FRAME_MS = 33                      # ~30 fps; enough for the fastest motion
 EDGE_SNAP_PX = 34                 # how close counts as "against the edge"
+ONSCREEN_MARGIN_PX = 12            # a pet must show at least this much of itself
 MIN_SCALE = 0.5
 MAX_SCALE = 2.0
 
@@ -127,13 +128,76 @@ class PetWindow(QWidget):
         screen = window.screen() if window else QApplication.primaryScreen()
         return screen.availableGeometry()
 
+    def is_onscreen(self) -> bool:
+        """Whether enough of the pet is actually on a screen to be seen.
+
+        Deliberately stricter than "intersects": a pet hanging one pixel over
+        an edge is, to the user, gone.  So a usable margin is required.
+
+        This is checked against **every** screen, not the one the window
+        happens to report.  ``window.screen()`` follows the window's centre, so
+        for a window that is entirely off the desktop it answers with the
+        nearest screen - which is exactly the question we are trying to ask.
+        """
+        margin = min(ONSCREEN_MARGIN_PX, self.width(), self.height())
+        x, y = self.x(), self.y()
+        w, h = self.width(), self.height()
+        for screen in QApplication.screens():
+            area = screen.availableGeometry()
+            if (x + w - margin > area.left() and x + margin < area.right()
+                    and y + h - margin > area.top() and y + margin < area.bottom()):
+                return True
+        return False
+
+    def ensure_on_screen(self) -> bool:
+        """Pull the pet back into view if it has drifted off the desktop.
+
+        The reported bug, on 2026-10-18: the pet sat at x=3306 on a 2560-wide
+        desktop, entirely outside the virtual desktop, and stayed there.  The
+        card beside it was visible, so the user saw a card with no pet - and
+        the pet was, by every measure the code had, perfectly alive.
+
+        ``clamp_to_screen`` would have fixed it, and that is the point: it is
+        only ever called on restore, on scale and at the end of a drag.  A pet
+        that is simply *sitting there* is never re-checked, so anything that
+        moves it - undocking a second monitor, a resolution change, a driver
+        reset - can strand it off-screen permanently, with nothing to notice
+        and no way back except dragging a window you cannot see.
+
+        So the check is now periodic, and it is done here rather than by asking
+        Qt, because the failure is precisely that Qt's own answer is wrong for
+        a window that is nowhere near a screen.
+        """
+        if self.is_onscreen():
+            return False
+        # Corner of the primary screen, inset so it cannot land under a taskbar
+        # or off the far edge - the same place a first run puts it.
+        area = QApplication.primaryScreen().availableGeometry()
+        self.move(int(area.right() - self.width() - 24),
+                  int(area.bottom() - self.height() - 12))
+        self.pinned_edge = None
+        return True
+
     def clamp_to_screen(self) -> None:
         """Keep the whole pet on some screen, even after a resolution change.
 
         This is the *restore* rule: never leave part of the pet off-screen.
         While dragging the window is allowed a little more slack (see
         :meth:`drag_bounds`) so that a flick at an edge actually snaps.
+
+        If the window is nowhere near any screen, the primary screen's corner
+        is used instead of ``available_rect``: when the window's centre is
+        outside the desktop, ``window.screen()`` answers with the nearest
+        screen, and clamping against *that* can leave the pet pinned to the
+        wrong edge of a monitor it is not even on.
         """
+        if not self.is_onscreen():
+            area = QApplication.primaryScreen().availableGeometry()
+            self.move(int(area.right() - self.width() - 24),
+                      int(area.bottom() - self.height() - 12))
+            self.pinned_edge = None
+            return
+
         area = self.available_rect()
         x = min(max(self.x(), area.left()), max(area.left(), area.right() - self.width()))
         y = min(max(self.y(), area.top()), max(area.top(), area.bottom() - self.height()))

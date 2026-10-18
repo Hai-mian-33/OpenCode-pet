@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from petcore import endpoint as endpoint_mod
 from petcore import i18n, paths
-from petcore.liveness import AbsentConfirm
+from petcore.liveness import AbsentConfirm, SleepWatch
 from petcore.lock import SingleInstance, pid_alive
 from petcore.lock import lock_path as single_instance_path
 
@@ -50,6 +50,45 @@ def log(message: str) -> None:
             handle.write("%s %s\n" % (time.strftime("%H:%M:%S"), message))
     except OSError:
         pass
+
+
+def arm_exit_tracing() -> None:
+    """Leave a record of how this process ended.
+
+    The sentinel is the single point of failure for the whole pet: if it dies,
+    nothing restarts the pet until the next sign-in.  And on 2026-10-18 it
+    *did* die, silently - it runs under ``pythonw.exe``, which discards stderr,
+    so an uncaught exception had nowhere to go and the watcher log simply
+    stopped.  That is an unactionable failure, so it cannot be how it happens
+    again.
+
+    These hooks cover the three ways this process can end that are otherwise
+    invisible: an uncaught exception on the main thread, one on a worker
+    thread, and a clean exit nobody logged.
+    """
+    def _report(what: str, text: str = "") -> None:
+        log("%s%s" % (what, ("\n" + text) if text else ""))
+
+    def excepthook(kind, value, tb) -> None:
+        import traceback
+        _report("UNCAUGHT EXCEPTION in the sentinel",
+                "".join(traceback.format_exception(kind, value, tb)))
+
+    def thread_excepthook(args) -> None:
+        import traceback
+        _report("UNCAUGHT EXCEPTION on thread %r"
+                % (getattr(args.thread, "name"),),
+                "".join(traceback.format_exception(args.exc_type, args.exc_value,
+                                                   args.exc_traceback)))
+
+    sys.excepthook = excepthook
+    try:
+        import threading
+        threading.excepthook = thread_excepthook
+    except Exception:                                      # noqa: BLE001
+        pass
+    import atexit
+    atexit.register(lambda: _report("sentinel is exiting (atexit)"))
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +273,11 @@ def launch_pet(language: str = "") -> bool:
     args = [paths.pythonw(), entry]
     if language:
         args += ["--lang", language]
+    # Says "this start was not requested by the user".  It is how the pet tells
+    # a background restart apart from somebody running it by hand, and therefore
+    # whether a previous "stay closed" request still applies.  Without it the
+    # user's own Exit is indistinguishable from a crash, and the pet comes back.
+    args.append("--from-sentinel")
     flags = 0x08000000 if os.name == "nt" else 0
     try:
         subprocess.Popen(args, cwd=paths.APP_ROOT, creationflags=flags,
@@ -294,6 +338,7 @@ def main(argv=None) -> int:
         return 0
 
     log("sentinel started (pid %d)" % os.getpid())
+    arm_exit_tracing()
     try:
         return _loop(args, lang)
     finally:
@@ -315,6 +360,8 @@ def _loop(args, lang: str, clock=None) -> int:
     app_up = False
     launched_at = 0.0
     gone = AbsentConfirm()
+    sleep_watch = SleepWatch()
+    stayed_off = False
 
     while True:
         # Nothing below may escape.  The sentinel is started **once**, at
@@ -323,6 +370,28 @@ def _loop(args, lang: str, clock=None) -> int:
         # desktop empty until the next logon with nothing in any log to say why.
         # So each pass is isolated and a failing pass is logged and retried.
         try:
+            # The user asked for the pet to stay closed.  Honour it, or Exit in
+            # the tray menu means nothing: the sentinel would relaunch the pet
+            # within a couple of seconds and the pet could never be shut off for
+            # longer than a blink.  Checked here rather than only in the pet, so
+            # this process also stops waiting for a pet that will never come.
+            if paths.user_quit():
+                if not stayed_off:
+                    log("the user closed the pet; the sentinel will not start it")
+                    stayed_off = True
+            else:
+                stayed_off = False
+
+            # A suspend is not OpenCode closing.  This laptop sleeps five times
+            # an hour, and just after a resume the process table cannot be
+            # trusted: ``psutil.process_iter`` can come back empty while
+            # OpenCode is very much alive.  Trusting that sample is what killed
+            # the pet on 2026-10-18.  See ``petcore/liveness.py``.
+            if sleep_watch.update():
+                log("the machine was asleep; not trusting process scans for %.0fs"
+                    % sleep_watch.settle)
+            trust = not sleep_watch.settling
+
             # ``app_alive``, not ``desktop_running``: closing the OpenCode window
             # leaves ``opencode-cli serve --service`` running, and the sessions it
             # holds are still there.  Watching the window alone made the pet exit
@@ -342,7 +411,7 @@ def _loop(args, lang: str, clock=None) -> int:
             # a ``psutil`` throw with an empty ``tasklist`` fallback - was enough
             # to stop the pet for the rest of the session.  See
             # ``petcore/liveness.py``.
-            confirmed_gone = gone.update(alive, clock())
+            confirmed_gone = gone.update(alive, clock(), trust=trust)
 
             if confirmed_gone:
                 if app_up:
@@ -350,7 +419,7 @@ def _loop(args, lang: str, clock=None) -> int:
                     log("opencode and its background service are gone "
                         "(confirmed after %.1fs)" % gone.grace)
                     kill_pet()
-            elif alive:
+            elif alive and not stayed_off:
                 if not app_up:
                     app_up = True
                     log("opencode detected%s"
@@ -365,6 +434,12 @@ def _loop(args, lang: str, clock=None) -> int:
                                                 and waited > RETRY_SECONDS):
                         launch_pet(lang)
                         launched_at = time.time()
+            elif stayed_off and app_up:
+                # OpenCode came back but the user closed the pet.  Say once, then
+                # keep quiet - this is the state that must last until a human
+                # asks for the pet again, not a transient condition to announce
+                # on every poll.
+                app_up = False
 
             if args.once:
                 return 0
