@@ -3419,6 +3419,141 @@ class TestMultipleEndpoints(unittest.TestCase):
                       "and more than one client has to be kept")
 
 
+class TestRemoteWorkspaceCredentials(unittest.TestCase):
+    """A remote workspace is identified by where its tunnel goes, not by port.
+
+    Reported 2026-10-20, one day after remote workspaces were first shown: the
+    pet had displayed the ACE conversation, and then *nothing* from that server
+    appeared - including a conversation that was running at the time.  OpenCode
+    had restarted, ssh had re-established the forward on a different local port,
+    and the password had been registered against the old one.  No error, no
+    card: the new port was probed with the local password, rejected in 50 ms,
+    and quietly dropped.
+
+    The port is not the identity.  ``user@host:port`` on the far side is, and it
+    is stable across every reconnect.
+    """
+
+    def _serve_guarded(self, password, holder):
+        """A stand-in service that actually enforces the password."""
+        import base64
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        wanted = "Basic " + base64.b64encode(
+            ("opencode:" + password).encode("utf-8")).decode("ascii")
+        payload = json.dumps({"version": "2.1.0", "pid": holder[1],
+                              "urls": [], "paths": {}}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                if self.headers.get("Authorization") != wanted:
+                    self.send_response(401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        holder[0] = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return "http://127.0.0.1:%d" % holder[0]
+
+    def _feed_tunnel(self, port, target, secrets):
+        """Make discovery see exactly one tunnel candidate.
+
+        The stand-in server is owned by python, not by ssh, so the real process
+        scan would never surface it.  Patching the three places that decide
+        *which* candidates exist and *what* they authenticate with keeps the
+        credential resolution itself under test.
+        """
+        from petcore import endpoint
+        original = (endpoint._candidate_urls, endpoint.ssh_forwards,
+                    endpoint.credentials)
+        endpoint._candidate_urls = lambda cached="", include_tunnels=True: [
+            ("http://127.0.0.1:%d" % port, "tunnel")]
+        endpoint.ssh_forwards = lambda: [endpoint.Forward(port, target)]
+        endpoint.credentials = lambda: dict(secrets)
+
+        def restore():
+            (endpoint._candidate_urls, endpoint.ssh_forwards,
+             endpoint.credentials) = original
+        self.addCleanup(restore)
+
+    def test_parse_forward_reads_both_ssh_forms(self):
+        from petcore.endpoint import parse_forward
+        four = parse_forward(["ssh", "-L", "127.0.0.1:56213:127.0.0.1:49374",
+                              "me@host", "sh -c 'exec cat >/dev/null'"])
+        self.assertEqual((four.local_port, four.target), (56213, "me@host:49374"))
+        three = parse_forward(["-L56213:localhost:49374", "me@host"])
+        self.assertEqual((three.local_port, three.target), (56213, "me@host:49374"))
+        self.assertIsNone(parse_forward(["ssh", "-R", "8080:localhost:80", "me@host"]),
+                          "-R forwards the wrong direction; it is not the API port")
+        self.assertIsNone(parse_forward(["ssh", "-L", "56213:localhost:49374"]),
+                          "without a destination there is no stable identity")
+
+    def test_a_secret_keyed_by_target_survives_a_changed_port(self):
+        from petcore import endpoint
+        holder = [0, 4242]
+        url = self._serve_guarded("remote-secret", holder)
+        self._feed_tunnel(holder[0], "me@host:49374",
+                          {"me@host:49374": "remote-secret"})
+        found = endpoint.discover_all(password="local-secret")
+        self.assertEqual([e.url for e in found], [url],
+                         "the target's password must be tried on whatever local "
+                         "port the tunnel currently uses")
+
+    def test_without_the_secret_the_endpoint_is_not_claimed(self):
+        from petcore import endpoint
+        holder = [0, 4243]
+        self._serve_guarded("remote-secret", holder)
+        self._feed_tunnel(holder[0], "me@host:49374", {})
+        self.assertEqual(endpoint.discover_all(password="local-secret"), [],
+                         "a 401 must stay a miss - guessing would put a broken "
+                         "client into every poll")
+
+    def test_add_endpoint_stores_the_target_not_the_port(self):
+        import argparse
+        import json
+        import shutil
+        import tempfile
+        import install
+        from petcore import endpoint
+
+        folder = tempfile.mkdtemp(prefix="pet-endpoints-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        store = os.path.join(folder, "pet-endpoints.json")
+        original = (endpoint.credentials_file, endpoint.probe,
+                    endpoint.tunnel_target)
+        endpoint.credentials_file = lambda: store
+        endpoint.probe = lambda url, password, timeout=1.2: endpoint.Endpoint(
+            url, password, 7, "2.1.0")
+        endpoint.tunnel_target = lambda url: "me@host:49374"
+
+        def restore():
+            (endpoint.credentials_file, endpoint.probe,
+             endpoint.tunnel_target) = original
+        self.addCleanup(restore)
+
+        code = install.cmd_add_endpoint(
+            argparse.Namespace(url="127.0.0.1:56213", password="remote-secret"))
+        self.assertEqual(code, 0)
+        with open(store, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        self.assertEqual(stored, {"me@host:49374": "remote-secret"},
+                         "the secret must outlive the tunnel's local port")
+        self.assertNotIn("56213", json.dumps(stored))
+
+
 class TestOneInstallationOnly(unittest.TestCase):
     """The pet lives in OpenCode's config, and only there.
 

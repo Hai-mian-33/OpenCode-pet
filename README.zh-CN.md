@@ -69,6 +69,21 @@ python install.py uninstall --keep-files
 python install.py status
 ```
 
+### 关掉它，以及让它回来
+
+右键桌宠 → **退出**，它是真的关闭：会在
+`%USERPROFILE%\.config\opencode\pet-quit` 写一个标记，此后看门狗和下次登录都
+不会把它拉起来，直到你明确要求。
+
+```bat
+python install.py disable        :: 关闭，并保持关闭
+python install.py enable         :: 让它回来
+```
+
+安装器还会注册一个 Windows 计划任务 **OpenCode Pet Sentinel**，每三分钟运行
+一次。它只在桌宠**没有被要求关闭**却停止时（崩溃、注销）把它拉起来；标记存在
+时它什么也不做。`python install.py status` 两者都会报告。
+
 ### 不安装直接运行
 
 ```bat
@@ -202,6 +217,36 @@ OpenCode 提供了带 SSE 事件流和会话列表接口的正式 HTTP API，所
 
 ---
 
+## 远程工作区
+
+通过 OpenCode 的 SSH 支持打开的远程工作区，会在**对面那台机器上**运行它自己的
+`opencode serve --service`，有自己的密码、自己的会话。它由 `ssh -L` 转发到本机，
+所以那个端口属于 `ssh.exe`，不属于 OpenCode。桌宠会监视每一个它能**验证**为
+OpenCode 的服务，因此这些会话也会正常出卡片 —— 但它的密码需要提供一次：
+
+```bat
+python install.py add-endpoint 127.0.0.1:56213
+:: 会提示输入该服务的密码，并先验证再保存
+```
+
+凭据写在 `%USERPROFILE%\.config\opencode\pet-endpoints.json`（权限 600），
+**刻意放在本仓库之外**：密码这种东西不该进 git。
+
+条目按隧道的**目标**登记 —— `user@host:49374` —— 而不是本机端口。这一点很
+关键：每次隧道重建、以及 OpenCode 每次重启，ssh 都会挑一个新的本地端口，按
+端口登记的凭据几小时内就失效，远程工作区会再次从桌宠上悄悄消失；按目标登记，
+则隧道换到哪个端口都继续有效。
+
+```bat
+python install.py status                      :: 每个服务，以及它现在在哪个端口
+python install.py remove-endpoint 127.0.0.1:56213
+python install.py remove-endpoint user@host:49374   :: 隧道断开时也能删
+```
+
+隧道当前没连上的工作区会被如实报告为未连接，而不是无限重试。
+
+---
+
 ## HTTP 事件桥
 
 桌宠监听 `127.0.0.1:8767`（被占用则顺延到 8767-8776），任何脚本都能往上推任务。
@@ -226,8 +271,9 @@ curl -X POST http://127.0.0.1:8767/event ^
 python tests\run_tests.py
 ```
 
-177 个单元测试、11 个文件，覆盖事件折叠、隐私边界、对账、优先级规则、保留与
-确认策略、i18n 词表、设置存储、端口发现、角色渲染（其中包括"机身永远是深炭
+214 个测试覆盖事件折叠、隐私边界、对账、优先级规则、保留与
+确认策略、i18n 词表、设置存储、端口发现、按隧道目标登记的远程工作区凭据
+（因此端口变化不会让工作区消失）、角色渲染（其中包括"机身永远是深炭
 黑、面板在任何状态下都是灰度"这两条不变量的断言）、真实套接字上的本地事件桥、
 双语托盘菜单、安装器的镜像规则与它生成的 VBScript 启动器、哨兵的单实例锁，
 以及"任何源文件都不得硬编码自身应用根目录之外的路径"这条承诺。

@@ -98,6 +98,177 @@ TUNNEL_PROCESS_NAMES = ("ssh.exe", "ssh", "pageant.exe", "putty.exe", "plink.exe
 # see remote workspaces" and "it can".
 TUNNEL_FALLBACK_PORTS = (59471, 49374, 59102)
 
+# ``ssh -L [bind:]port:host:hostport`` - both the 3-part and 4-part forms, with
+# optional brackets for IPv6 literals.
+_FORWARD_SPEC_RE = re.compile(
+    r"^(?:(?P<bind>\[[^\]]+\]|[^:]+):)?(?P<local>\d+):"
+    r"(?P<rhost>\[[^\]]+\]|[^:]+):(?P<rport>\d+)$")
+_FORWARD_JOINED_RE = re.compile(r"^-L(?P<spec>.+)$")
+
+
+class Forward:
+    """One live ``ssh -L`` forward: a local port and the remote it reaches.
+
+    ``target`` is the stable identity of a remote workspace - ``user@host:port``
+    on the far end - while ``local_port`` is chosen by ssh again every time the
+    connection is re-established.  Credentials keyed by port therefore rot the
+    moment OpenCode restarts; keyed by target they keep working.
+    """
+
+    __slots__ = ("local_port", "target", "pid")
+
+    def __init__(self, local_port: int, target: str, pid: int = 0):
+        self.local_port = int(local_port)
+        self.target = target
+        self.pid = int(pid or 0)
+
+    def __repr__(self):
+        return "Forward(127.0.0.1:%d -> %s)" % (self.local_port, self.target)
+
+
+def parse_forward(args: Iterable[str]) -> Optional[Forward]:
+    """Read an ``ssh`` command line into a :class:`Forward`, if it has one.
+
+    Kept pure and argument-shaped so it can be tested without ssh.  Anything
+    that is not a local ``-L`` forward - a plain session, a ``-R`` remote
+    forward, a Unix socket - yields ``None``.
+    """
+    spec, destination = "", ""
+    tokens = list(args or ())
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-L" and index + 1 < len(tokens):
+            spec = tokens[index + 1]
+            index += 2
+            continue
+        joined = _FORWARD_JOINED_RE.match(token)
+        if joined:
+            spec = joined.group("spec")
+        elif not token.startswith("-") and "@" in token:
+            # The destination is the only bare token that looks like user@host;
+            # the remote command that follows is a single token of its own.
+            destination = token
+        index += 1
+
+    if not spec or not destination:
+        return None
+    if "/" in spec:                       # ssh -L /tmp/sock:host:port
+        return None
+    match = _FORWARD_SPEC_RE.match(spec)
+    if not match:
+        return None
+    return Forward(int(match.group("local")),
+                   "%s:%s" % (destination, match.group("rport")))
+
+
+def _cmdline(pid: int) -> List[str]:
+    try:
+        import psutil  # type: ignore
+        return list(psutil.Process(pid).cmdline())
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        output = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine"
+             % int(pid)],
+            capture_output=True, timeout=8, creationflags=_NO_WINDOW,
+        ).stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return output.split() if output else []
+
+
+def ssh_forwards() -> List[Forward]:
+    """Every live local forward owned by an ssh-like process.
+
+    This is how a remote workspace is identified *without* a fixed port: the
+    tunnel's local port changes on every reconnect, but it always forwards to
+    the same ``user@host:port``.
+    """
+    found: List[Forward] = []
+    for pid in _pids_named(TUNNEL_PROCESS_NAMES):
+        forward = parse_forward(_cmdline(pid))
+        if forward is not None:
+            forward.pid = pid
+            found.append(forward)
+    return found
+
+
+def tunnel_target(url: str) -> str:
+    """The ``user@host:port`` ``url`` forwards to, or ``""`` if it is local."""
+    port = _port_of(url)
+    if not port:
+        return ""
+    for forward in ssh_forwards():
+        if forward.local_port == port:
+            return forward.target
+    return ""
+
+
+def _port_of(url: str) -> int:
+    match = re.search(r":(\d{2,5})(?:/|$)", url or "")
+    return int(match.group(1)) if match else 0
+
+
+def credentials_file() -> str:
+    """Where extra, per-endpoint credentials live.
+
+    Deliberately in OpenCode's own config directory and never in this project:
+    a remote workspace's service password is a secret, and a secret does not
+    belong in a git repository.  Nothing here is ever written by the pet - it
+    cannot know the password - only read.
+    """
+    return os.path.join(paths.opencode_config_dir(), "pet-endpoints.json")
+
+
+def credentials() -> Dict[str, str]:
+    """``{identity: password}`` for services that are not the local one.
+
+    The identity is either an endpoint URL (``http://127.0.0.1:56213``) or, for
+    a remote workspace, its **tunnel target** (``user@host:49374``).  The target
+    is what matters in practice: ssh picks a fresh local port on every
+    reconnect, so a URL-keyed secret starts returning HTTP 401 the first time
+    OpenCode restarts - the pet then silently stops seeing that workspace.
+
+    Two sources, both explicit:
+
+    * ``OPENCODE_ENDPOINT_PASSWORDS`` - ``identity=password`` pairs separated by
+      commas or semicolons.  Useful in a script or a CI job.
+    * ``~/.config/opencode/pet-endpoints.json`` - a JSON object of the same
+      shape.  This is what ``install.py add-endpoint`` writes.
+
+    Without this, a remote workspace is unreachable in practice: it runs its own
+    ``opencode serve --service`` with its own password in its own
+    ``service.json``, so the local one is simply rejected - HTTP 401, in 50 ms,
+    with no hint that the endpoint was even real.
+    """
+    found: Dict[str, str] = {}
+
+    raw = os.environ.get("OPENCODE_ENDPOINT_PASSWORDS") or ""
+    for part in re.split(r"[,;\s]+", raw.strip()):
+        if "=" in part:
+            url, _, password = part.partition("=")
+            if url.strip():
+                found[url.strip().rstrip("/")] = password
+
+    try:
+        with open(credentials_file(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        for url, password in data.items():
+            if isinstance(url, str) and isinstance(password, str):
+                found[url.rstrip("/")] = password
+    return found
+
+
+def password_for(url: str, default: str = "") -> str:
+    """The password for ``url``: its own if it has one, else the local one."""
+    return credentials().get(url.rstrip("/"), default)
+
 
 # ---------------------------------------------------------------------------
 # validation
@@ -248,24 +419,28 @@ def _env_endpoints() -> List[str]:
     return urls
 
 
-def _candidate_urls(cached: str = "", include_tunnels: bool = True) -> List[str]:
-    """Every URL worth asking, in descending order of confidence.
+def _candidate_urls(cached: str = "", include_tunnels: bool = True) -> List[Tuple[str, str]]:
+    """Every URL worth asking, with what kind of guess it is.
 
-    ``cached`` and the environment come first so the common case - one local
-    service - costs exactly what it always cost.  The tunnel ports come last
-    because they only exist for remote workspaces and each one costs a probe.
+    The kind matters twice over.  A *tunnel* candidate is a remote service
+    reached through an SSH forward, so it gets a realistic deadline - a round
+    trip crosses a network - and it is looked up in the per-endpoint credential
+    table, because a remote ``opencode serve`` has its own password and rejects
+    the local one outright.  Local candidates keep the local password and the
+    short deadline that keeps the poll loop free.
     """
-    candidates: List[str] = []
+    candidates: List[Tuple[str, str]] = []
     if cached:
-        candidates.append(cached if "//" in cached else "http://" + cached)
-    candidates.extend(_env_endpoints())
-    candidates.extend("http://127.0.0.1:%d" % p
-                      for p in _listening_ports(_pids_named(SERVICE_PROCESS_NAMES)))
-    candidates.extend("http://127.0.0.1:%d" % p for p in FALLBACK_PORTS)
+        candidates.append((cached if "//" in cached else "http://" + cached, "cached"))
+    candidates.extend((u, "named") for u in _env_endpoints())
+    candidates.extend(("http://127.0.0.1:%d" % p, "local") for p in
+                      _listening_ports(_pids_named(SERVICE_PROCESS_NAMES)))
+    candidates.extend(("http://127.0.0.1:%d" % p, "local") for p in FALLBACK_PORTS)
     if include_tunnels:
-        candidates.extend("http://127.0.0.1:%d" % p
-                          for p in _listening_ports(_pids_named(TUNNEL_PROCESS_NAMES)))
-        candidates.extend("http://127.0.0.1:%d" % p for p in TUNNEL_FALLBACK_PORTS)
+        candidates.extend(("http://127.0.0.1:%d" % p, "tunnel") for p in
+                          _listening_ports(_pids_named(TUNNEL_PROCESS_NAMES)))
+        candidates.extend(("http://127.0.0.1:%d" % p, "tunnel") for p in
+                          TUNNEL_FALLBACK_PORTS)
     return candidates
 
 
@@ -287,23 +462,39 @@ def discover_all(cached: str = "", password: str = None,
     """
     if password is None:
         password = read_password()
-    if not password:
-        return []
+    known = credentials()
+    # One process-table walk per discovery, not one per candidate: the tunnel
+    # map is what turns "some ssh port" into "the 5090 workspace".
+    try:
+        targets = {f.local_port: f.target for f in ssh_forwards()}
+    except Exception:                                     # noqa: BLE001
+        targets = {}
 
     found: List[Endpoint] = []
     seen = set()
-    candidates = _candidate_urls(cached, include_tunnels)
-    # Speculative candidates - guessed ports, other people's listeners - get a
-    # much shorter deadline than the cached one.  The cached endpoint is the one
-    # we already know works, so it deserves to wait; the rest exist in the hope
-    # that one answers, and a port that accepts a connection but never replies
-    # must not hold the pet's poll loop for a second.
-    for index, url in enumerate(candidates):
+    for url, kind in _candidate_urls(cached, include_tunnels):
         url = url.rstrip("/")
         if url in seen:
             continue
         seen.add(url)
-        endpoint = probe(url, password, timeout=1.2 if index == 0 else 0.35)
+        # A remote workspace answers to its own password.  Trying the local one
+        # first is not a fallback, it is a guaranteed 401.  The credential is
+        # looked up by tunnel target as well as by URL, so it survives the port
+        # changing on the next reconnect.
+        own = known.get(url)
+        if own is None and kind == "tunnel":
+            target = targets.get(_port_of(url))
+            if target:
+                own = known.get(target)
+        if own is not None:
+            secret, timeout = own, 2.5
+        elif kind == "tunnel":
+            # No registered secret: almost certainly another tool's tunnel.
+            # Ask once, cheaply, and move on.
+            secret, timeout = password, 0.4
+        else:
+            secret, timeout = password, 1.2 if kind == "cached" else 0.35
+        endpoint = probe(url, secret, timeout=timeout)
         if endpoint and endpoint.url not in {e.url for e in found}:
             found.append(endpoint)
     return found
@@ -325,7 +516,8 @@ def discover(cached: str = "", password: str = None) -> Tuple[Optional[Endpoint]
     if not password:
         return None, "err.no_password"
 
-    candidates: List[str] = _candidate_urls(cached, include_tunnels=False)
+    candidates: List[str] = [url for url, _kind
+                             in _candidate_urls(cached, include_tunnels=False)]
     seen = set()
     for url in candidates:
         url = url.rstrip("/")

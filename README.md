@@ -74,6 +74,22 @@ python install.py uninstall --keep-files
 python install.py status
 ```
 
+### Stopping it, and bringing it back
+
+Right-click the pet → **Exit** closes it for good. A latch is written to
+`%USERPROFILE%\.config\opencode\pet-quit`, and neither the watchdog nor the next
+sign-in will start it again until you ask.
+
+```bat
+python install.py disable        :: close it and keep it closed
+python install.py enable         :: welcome it back
+```
+
+The installer also registers a Windows scheduled task, **OpenCode Pet Sentinel**,
+which runs every three minutes. It restarts the pet if it stopped *without*
+being asked to - a crash, a logoff - and does nothing at all while the latch is
+present. `python install.py status` reports both.
+
 ### Run it without installing
 
 ```bat
@@ -217,6 +233,42 @@ absent from the resulting facts.
 
 ---
 
+## Remote workspaces
+
+A remote workspace opened through OpenCode's SSH support runs its **own**
+`opencode serve --service` on the far machine, with its own password and its own
+sessions. It is exposed locally by an `ssh -L` forward, so that port belongs to
+`ssh.exe`, not to OpenCode. The pet watches every service it can prove is
+OpenCode, so those conversations get cards like any other - but their password
+has to be supplied once:
+
+```bat
+python install.py add-endpoint 127.0.0.1:56213
+:: prompts for that service's password, and verifies it before saving
+```
+
+The secret is written to `%USERPROFILE%\.config\opencode\pet-endpoints.json`
+(mode 600). It lives deliberately **outside this repository**: a secret has no
+business in git.
+
+The entry is keyed by the tunnel's **destination** - `user@host:49374` - not by
+its local port. That distinction matters: ssh picks a new local port every time
+the forward is re-established, and OpenCode re-establishes it on every restart,
+so a port-keyed secret goes stale within hours and the remote workspace silently
+vanishes from the pet again. Keyed by destination it keeps working, whatever
+port the tunnel lands on next.
+
+```bat
+python install.py status                      :: every service, and where it lives now
+python install.py remove-endpoint 127.0.0.1:56213
+python install.py remove-endpoint user@host:49374   :: also works when the tunnel is down
+```
+
+A workspace whose tunnel is not currently connected is reported as such instead
+of being probed forever.
+
+---
+
 ## HTTP event bridge
 
 The pet listens on `127.0.0.1:8767` (8767-8776 if taken) so any script can
@@ -243,14 +295,15 @@ drives the whole vocabulary through the bridge.
 python tests\run_tests.py
 ```
 
-177 unit tests across eleven files cover the event fold, the privacy boundary,
-reconciliation, the priority rule, retention and acknowledgement, the i18n
-catalogue, the settings store, endpoint discovery, the character renderer
+214 tests cover the event fold, the privacy boundary, reconciliation, the
+priority rule, retention and acknowledgement, the i18n catalogue, the settings
+store, endpoint discovery, remote-workspace credentials keyed by tunnel
+destination (so a changed port cannot hide a workspace), the character renderer
 (including the invariant that the body is permanently charcoal and the face
 panel stays greyscale in every state), the loopback bridge over a real socket,
-the tray menu in both languages, the installer's mirror rules and its
-generated VBScript launcher, the sentinel's single-instance lock, and the
-promise that no source file hardcodes a path outside its own application root.
+the tray menu in both languages, the installer's mirror rules and its generated
+VBScript launcher, the sentinel's single-instance lock, and the promise that no
+source file hardcodes a path outside its own application root.
 
 ```
 python tests\run_tests.py

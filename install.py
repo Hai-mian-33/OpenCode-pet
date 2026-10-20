@@ -15,6 +15,7 @@ no registry key, no service, no code injected into OpenCode.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -441,6 +442,33 @@ def cmd_status(_args) -> int:
           % ("%s (every %d min)" % (WATCHDOG_TASK, WATCHDOG_MINUTES)
              if watchdog_installed() else "OFF - the sentinel will not recover"))
     print("  state file    : %s" % os.path.join(destination, "pet_state.json"))
+    extra = _load_extra_endpoints()
+    print("  extra services: %s"
+          % (", ".join(sorted(extra)) if extra else "none registered"))
+    if extra:
+        from petcore import endpoint as endpoint_mod
+        try:
+            forwards = endpoint_mod.ssh_forwards()
+            for key in sorted(extra):
+                if "://" in key:
+                    found = endpoint_mod.probe(key, extra[key], timeout=4.0)
+                    print("    %-30s %s" % (key, "reachable" if found
+                                           else "*** unreachable ***"))
+                    continue
+                # A tunnel target: report the port it currently lives on,
+                # which is the whole point of keying by target.
+                live = [f for f in forwards if f.target == key]
+                if not live:
+                    print("    %-30s tunnel not connected" % key)
+                    continue
+                for forward in live:
+                    url = "http://127.0.0.1:%d" % forward.local_port
+                    found = endpoint_mod.probe(url, extra[key], timeout=4.0)
+                    print("    %-30s %s  (now on 127.0.0.1:%d)"
+                          % (key, "reachable" if found else "*** unreachable ***",
+                             forward.local_port))
+        except Exception as exc:                           # noqa: BLE001
+            print("    (could not check: %r)" % (exc,))
     print("  settings file : %s" % paths.settings_file())
     try:
         from petcore import endpoint as endpoint_mod
@@ -448,6 +476,132 @@ def cmd_status(_args) -> int:
                                        else "not running"))
     except Exception:                                      # noqa: BLE001
         pass
+    return 0
+
+
+def _load_extra_endpoints() -> dict:
+    from petcore import endpoint as endpoint_mod
+    try:
+        with open(endpoint_mod.credentials_file(), "r", encoding="utf-8") as h:
+            data = json.load(h)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_extra_endpoints(data: dict) -> bool:
+    from petcore import endpoint as endpoint_mod
+    path = endpoint_mod.credentials_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+        try:
+            os.chmod(path, 0o600)          # a secret: owner read/write only
+        except OSError:
+            pass                          # not supported on every filesystem
+        return True
+    except OSError as exc:
+        print("  ! could not write %s: %s" % (path, exc))
+        return False
+
+
+def cmd_add_endpoint(args) -> int:
+    """Register a second OpenCode service - usually a remote workspace.
+
+    A remote workspace runs its own ``opencode serve --service`` with its own
+    password in its own ``service.json``, and it is reached over an SSH forward
+    whose local port belongs to ``ssh.exe``.  The pet can therefore find it -
+    the port is in the tunnel scan - but cannot authenticate to it: the local
+    password is simply rejected, in milliseconds, with no hint that the
+    endpoint was real.  That is why a conversation open in a remote workspace
+    could be completely invisible to the pet.
+
+    So the password has to be supplied once.  It is stored in OpenCode's config
+    directory, **not** in this repository: a secret has no business in git.
+    """
+    url = (args.url or "").strip().rstrip("/")
+    password = args.password
+    if not url:
+        print("Usage: python install.py add-endpoint <url> [password]")
+        return 2
+    if "://" not in url:
+        url = "http://" + url
+
+    if not password:
+        # Read it without echoing it.
+        try:
+            import getpass
+            password = getpass.getpass("Password for %s: " % url)
+        except Exception:                                  # noqa: BLE001
+            print("  ! no password given; nothing was changed")
+            return 2
+    if not password:
+        print("  ! empty password; nothing was changed")
+        return 2
+
+    from petcore import endpoint as endpoint_mod
+    proven = endpoint_mod.probe(url, password, timeout=6.0)
+    data = _load_extra_endpoints()
+    if proven is None:
+        print("  ! %s did not accept that password as an OpenCode service" % url)
+        print("    nothing was written - a wrong entry would be re-probed every "
+              "few seconds forever")
+        return 1
+
+    # Key the secret by *what the endpoint is*, not by the port it happens to
+    # use today.  ssh allocates a new local port every time the tunnel is
+    # re-established - and OpenCode re-establishes it on every restart - so a
+    # port-keyed secret stops matching within hours and the remote workspace
+    # silently disappears from the pet again.
+    target = endpoint_mod.tunnel_target(url)
+    if target:
+        for stale in [key for key in data if "://" in key
+                      and endpoint_mod.tunnel_target(key) == target]:
+            data.pop(stale, None)
+        data.pop(url, None)
+        key = target
+        print("  added  : %s -> %s  (v%s, pid %s)"
+              % (target, url, proven.version, proven.pid))
+        print("  follows: that tunnel, whatever local port it uses next time")
+    else:
+        key = url
+        print("  added  : %s  (v%s, pid %s)" % (url, proven.version, proven.pid))
+
+    data[key] = password
+    if not _save_extra_endpoints(data):
+        return 1
+    print("  stored : %s" % endpoint_mod.credentials_file())
+    print("\nRestart the pet to pick it up:  python install.py enable")
+    return 0
+
+
+def cmd_remove_endpoint(args) -> int:
+    from petcore import endpoint as endpoint_mod
+    key = (args.url or "").strip().rstrip("/")
+    if not key:
+        print("Usage: python install.py remove-endpoint <url-or-target>")
+        return 2
+    data = _load_extra_endpoints()
+    candidates = {key}
+    if "://" not in key:
+        candidates.add("http://" + key)
+    else:
+        candidates.add(key.split("://", 1)[1])
+    # Accept the current tunnel URL even when the secret is stored by target.
+    url = key if "://" in key else "http://" + key
+    target = endpoint_mod.tunnel_target(url)
+    if target:
+        candidates.add(target)
+
+    removed = [c for c in candidates if c in data]
+    if not removed:
+        print("  %s was not registered" % key)
+        return 1
+    for entry in removed:
+        data.pop(entry, None)
+    _save_extra_endpoints(data)
+    print("  removed : %s" % ", ".join(sorted(removed)))
     return 0
 
 
@@ -505,6 +659,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("disable",
                    help="close the pet and keep it closed"
                    ).set_defaults(func=cmd_disable)
+
+    add_ep = sub.add_parser(
+        "add-endpoint",
+        help="register another OpenCode service, e.g. a remote workspace")
+    add_ep.add_argument("url", help="the local URL the tunnel exposes, "
+                                     "e.g. 127.0.0.1:62701")
+    add_ep.add_argument("password", nargs="?", default=None,
+                        help="that service's password (prompted for if omitted)")
+    add_ep.set_defaults(func=cmd_add_endpoint)
+
+    rm_ep = sub.add_parser("remove-endpoint", help="forget a registered service")
+    rm_ep.add_argument("url")
+    rm_ep.set_defaults(func=cmd_remove_endpoint)
     return parser
 
 
